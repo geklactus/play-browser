@@ -31,7 +31,9 @@ number GitHub shows on the asset).
 - `patches/*.patch` — applied with `git apply` before the build, in name order:
   - `0001-link-idbfs.patch`: links Emscripten's IDBFS so a page can mount an IndexedDB
     filesystem over Play!'s data directory (memory cards, config) and keep saves across
-    reloads. Upstream's build has only the in-memory filesystem.
+    reloads — upstream's build has only the in-memory filesystem. Also exports `HEAPU8`
+    explicitly (a `discImageDevice` writes disc sectors into it; newer emsdks stop
+    exporting the heap views by default).
 
 ## Releasing
 
