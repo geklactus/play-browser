@@ -1,0 +1,51 @@
+diff --git a/Source/ui_js/InputProviderEmscripten.cpp b/Source/ui_js/InputProviderEmscripten.cpp
+index 763bc0f..7fd7d13 100644
+--- a/Source/ui_js/InputProviderEmscripten.cpp
++++ b/Source/ui_js/InputProviderEmscripten.cpp
+@@ -85,17 +85,17 @@ BINDINGTARGET CInputProviderEmscripten::MakeBindingTarget(const EM_UTF8* code)
+ 		keyCode = INPUT_KEY_X;
+ 	else if(!strcmp(code, "KeyZ"))
+ 		keyCode = INPUT_KEY_Z;
+-	else if(!strcmp(code, "Key0"))
++	else if(!strcmp(code, "Digit0"))
+ 		keyCode = INPUT_KEY_0;
+-	else if(!strcmp(code, "Key1"))
++	else if(!strcmp(code, "Digit1"))
+ 		keyCode = INPUT_KEY_1;
+-	else if(!strcmp(code, "Key2"))
++	else if(!strcmp(code, "Digit2"))
+ 		keyCode = INPUT_KEY_2;
+-	else if(!strcmp(code, "Key3"))
++	else if(!strcmp(code, "Digit3"))
+ 		keyCode = INPUT_KEY_3;
+-	else if(!strcmp(code, "Key8"))
++	else if(!strcmp(code, "Digit8"))
+ 		keyCode = INPUT_KEY_8;
+-	else if(!strcmp(code, "Key9"))
++	else if(!strcmp(code, "Digit9"))
+ 		keyCode = INPUT_KEY_9;
+ 	else
+ 		keyCode = code[0];
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 999e24c..d91c3b2 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -81,12 +81,12 @@ extern "C" void initVm()
+ 		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::CROSS, CInputProviderEmscripten::MakeBindingTarget("KeyZ"));
+ 		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::TRIANGLE, CInputProviderEmscripten::MakeBindingTarget("KeyS"));
+ 		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::CIRCLE, CInputProviderEmscripten::MakeBindingTarget("KeyX"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L1, CInputProviderEmscripten::MakeBindingTarget("Key1"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L2, CInputProviderEmscripten::MakeBindingTarget("Key2"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L3, CInputProviderEmscripten::MakeBindingTarget("Key3"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R1, CInputProviderEmscripten::MakeBindingTarget("Key8"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R2, CInputProviderEmscripten::MakeBindingTarget("Key9"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R3, CInputProviderEmscripten::MakeBindingTarget("Key0"));
++		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L1, CInputProviderEmscripten::MakeBindingTarget("Digit1"));
++		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L2, CInputProviderEmscripten::MakeBindingTarget("Digit2"));
++		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L3, CInputProviderEmscripten::MakeBindingTarget("Digit3"));
++		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R1, CInputProviderEmscripten::MakeBindingTarget("Digit8"));
++		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R2, CInputProviderEmscripten::MakeBindingTarget("Digit9"));
++		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R3, CInputProviderEmscripten::MakeBindingTarget("Digit0"));
+ 
+ 		bindingManager.SetSimulatedAxisBinding(0, PS2::CControllerInfo::ANALOG_LEFT_X,
+ 		                                       CInputProviderEmscripten::MakeBindingTarget("KeyF"),

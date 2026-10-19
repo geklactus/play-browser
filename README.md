@@ -34,6 +34,10 @@ number GitHub shows on the asset).
     reloads — upstream's build has only the in-memory filesystem. Also exports `HEAPU8`
     explicitly (a `discImageDevice` writes disc sectors into it; newer emsdks stop
     exporting the heap views by default).
+  - `0002-keyboard-digit-codes.patch`: the shoulder buttons and stick clicks are bound
+    to `Key1`…`Key9`, which no keyboard sends — `KeyboardEvent.code` for the number row is
+    `Digit1`…`Digit9`. Bound to the real codes, so L1/L2/L3 and R1/R2/R3 work from a
+    keyboard (1 2 3 and 8 9 0).
 
 ## Releasing
 
