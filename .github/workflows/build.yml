@@ -1,0 +1,138 @@
+name: Build
+
+# Builds Play!'s browser target (Play.js + Play.wasm) from the upstream commit pinned in
+# `play-commit`, with the patches in patches/ applied, using the emsdk version pinned in
+# `emsdk-version` (the same one upstream's own CI uses). Every run uploads the result as a
+# workflow artifact; a tag push (v*) or a manual run with a version also publishes it as a
+# GitHub release, which is what consumers download and verify by sha256.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to publish (creates tag v<version>); empty = build only"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+
+      - name: Read the pins
+        id: pins
+        run: |
+          echo "commit=$(tr -d '[:space:]' < play-commit)" >> "$GITHUB_OUTPUT"
+          echo "emsdk=$(tr -d '[:space:]' < emsdk-version)" >> "$GITHUB_OUTPUT"
+          ver="${{ github.event.inputs.version }}"
+          if [ -z "$ver" ] && [ "${GITHUB_REF_TYPE}" = tag ]; then ver="${GITHUB_REF_NAME#v}"; fi
+          [ -n "$ver" ] || ver="0.0.0-$(tr -d '[:space:]' < play-commit | cut -c1-7)"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Play! $(cat play-commit) · emsdk $(cat emsdk-version) · version $ver"
+
+      - name: Checkout Play! at the pinned commit (with submodules)
+        uses: actions/checkout@v7
+        with:
+          repository: jpd002/Play-
+          ref: ${{ steps.pins.outputs.commit }}
+          submodules: recursive
+          fetch-depth: 1
+          path: play
+
+      - name: Apply patches
+        run: |
+          set -e
+          shopt -s nullglob
+          cd play
+          for p in ../patches/*.patch; do
+            echo "== $p"
+            git apply --verbose "$p"
+          done
+          git status --short
+
+      - name: Setup Emscripten ${{ steps.pins.outputs.emsdk }}
+        uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: ${{ steps.pins.outputs.emsdk }}
+
+      - name: Install ninja
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build
+
+      - name: Configure
+        working-directory: play
+        run: emcmake cmake --preset wasm-ninja
+
+      - name: Build (Play only)
+        working-directory: play
+        run: cmake --build build_cmake/build/wasm-ninja --config Release --target Play
+
+      - name: Package
+        id: pkg
+        run: |
+          set -e
+          out="play/build_cmake/build/wasm-ninja/Source/ui_js/Release"
+          ver="${{ steps.pins.outputs.version }}"
+          name="play-browser-$ver"
+          mkdir -p "dist/$name"
+          cp "$out/Play.js" "$out/Play.wasm" "dist/$name/"
+          # Sanity: a wasm module, and the IDBFS patch took (the memory-card store needs it).
+          [ "$(head -c4 "dist/$name/Play.wasm" | od -An -tx1 | tr -d ' \n')" = "0061736d" ]
+          grep -q "IDBFS" "dist/$name/Play.js"
+          cp play/License.txt "dist/$name/LICENSE-Play.txt"
+          {
+            echo "play-browser $ver"
+            echo "play-commit: ${{ steps.pins.outputs.commit }}"
+            echo "play-source: https://github.com/jpd002/Play-/tree/${{ steps.pins.outputs.commit }}"
+            echo "emsdk: ${{ steps.pins.outputs.emsdk }}"
+            echo "patches:"; ls patches/*.patch 2>/dev/null | sed 's/^/  /'
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ) by ${{ github.repository }} run ${{ github.run_id }}"
+          } > "dist/$name/MANIFEST"
+          (cd "dist/$name" && sha256sum Play.js Play.wasm > SHA256SUMS)
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" | tee "$name.tar.gz.sha256")
+          ls -la dist "dist/$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            dist/${{ steps.pkg.outputs.name }}.tar.gz
+            dist/${{ steps.pkg.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' || github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          ver="${{ steps.pins.outputs.version }}"
+          name="${{ steps.pkg.outputs.name }}"
+          tag="v$ver"
+          notes="$(cat "dist/$name/MANIFEST"; echo; echo '```'; cat "dist/$name.tar.gz.sha256"; echo '```')"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists; uploading assets (clobber)"
+            gh release upload "$tag" "dist/$name.tar.gz" "dist/$name.tar.gz.sha256" --clobber
+          else
+            gh release create "$tag" "dist/$name.tar.gz" "dist/$name.tar.gz.sha256" \
+              --target "$GITHUB_SHA" --title "$name" --notes "$notes"
+          fi
