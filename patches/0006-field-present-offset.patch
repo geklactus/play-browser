@@ -1,0 +1,218 @@
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 7eb9460..f52ec07 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -116,6 +116,8 @@ void CGSH_OpenGL::ResetImpl()
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
+ 	m_vertexBuffer.clear();
++	m_drawFramebuffer = nullptr;
++	m_lastPresentedOfsYValid = false;
+ 	m_renderState.isValid = false;
+ 	m_validGlState = 0;
+ 	m_nVtxCount = 0;
+@@ -194,6 +196,10 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 	{
+ 		float u1 = static_cast<float>(dispLayer.width) / static_cast<float>(framebuffer->m_width);
+ 		float v1 = static_cast<float>(dispLayer.height) / static_cast<float>(framebuffer->m_height);
++		//A field drawn half a line up (field mode) is sampled half a line up, so it lands
++		//where the other field does; a whole picture shifts, nothing is resampled twice.
++		float fieldOfsY = FieldPresentOffset(framebuffer);
++		float v0 = -fieldOfsY / static_cast<float>(framebuffer->m_height);
+ 
+ 		glDisable(GL_BLEND);
+ 		glDisable(GL_DEPTH_TEST);
+@@ -217,6 +223,9 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 		assert(m_presentTexCoordScaleUniform != -1);
+ 		glUniform2f(m_presentTexCoordScaleUniform, u1, v1);
+ 
++		assert(m_presentTexCoordOffsetUniform != -1);
++		glUniform2f(m_presentTexCoordOffsetUniform, 0, v0);
++
+ 		glBindBuffer(GL_ARRAY_BUFFER, m_presentVertexBuffer);
+ 		glBindVertexArray(m_presentVertexArray);
+ 
+@@ -244,6 +253,42 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 	CGSHandler::FlipImpl(dispInfo);
+ }
+ 
++float CGSH_OpenGL::FieldPresentOffset(const FramebufferPtr& framebuffer)
++{
++	//Field mode: SMODE2 interlaced with FFMD set, each field a half-height buffer
++	//(GetDisplayRect halves the height for the same condition). The two fields were drawn
++	//with XYOFFSETs half a line apart; the one drawn higher is shown that much lower.
++	//Compared with the field shown at the previous flip rather than with a fixed parity:
++	//whichever of the two has the larger offset is the one moved up, whatever the game
++	//calls it. A whole-line difference is a different origin (a menu buffer, say), not a
++	//field offset, and is left alone.
++	framebuffer->SettleDrawOfsY();
++	if(!(GetCrtIsInterlaced() && GetCrtIsFrameMode()))
++	{
++		m_lastPresentedOfsYValid = false;
++		return 0;
++	}
++	float ofsY = framebuffer->m_drawOfsY;
++	float result = 0;
++	if(m_lastPresentedOfsYValid)
++	{
++		float delta = ofsY - m_lastPresentedOfsY;
++		if(delta == 0.f)
++		{
++			//The same field again (a repeated frame): keep it where it was.
++			result = m_lastPresentedShift;
++		}
++		else if((delta > 0.f) && (delta < 1.f))
++		{
++			result = delta;
++		}
++	}
++	m_lastPresentedOfsY = ofsY;
++	m_lastPresentedShift = result;
++	m_lastPresentedOfsYValid = true;
++	return result;
++}
++
+ void CGSH_OpenGL::LoadState(Framework::CZipArchiveReader& archive)
+ {
+ 	CGSHandler::LoadState(archive);
+@@ -267,6 +312,8 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
+ 	PalCache_Flush();
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
++	m_drawFramebuffer = nullptr;
++	m_lastPresentedOfsYValid = false;
+ 	CGSHandler::NotifyPreferencesChangedImpl();
+ }
+ 
+@@ -290,6 +337,7 @@ void CGSH_OpenGL::InitializeRC()
+ 	m_presentVertexArray = GeneratePresentVertexArray();
+ 	m_presentTextureUniform = glGetUniformLocation(*m_presentProgram, "g_texture");
+ 	m_presentTexCoordScaleUniform = glGetUniformLocation(*m_presentProgram, "g_texCoordScale");
++	m_presentTexCoordOffsetUniform = glGetUniformLocation(*m_presentProgram, "g_texCoordOffset");
+ 
+ 	m_copyToFbProgram = GenerateCopyToFbProgram();
+ 	m_copyToFbTexture = Framework::OpenGl::CTexture::Create();
+@@ -596,6 +644,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 			auto offsetFast = make_convertible<XYOFFSET>(m_nReg[GS_REG_XYOFFSET_1 + context]);
+ 			m_nPrimOfsX = offsetFast.GetX();
+ 			m_nPrimOfsY = offsetFast.GetY();
++			if(m_drawFramebuffer) m_drawFramebuffer->CountDrawOfsY(m_nPrimOfsY);
+ 			return;
+ 		}
+ 	}
+@@ -681,6 +730,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	auto offset = make_convertible<XYOFFSET>(m_nReg[GS_REG_XYOFFSET_1 + context]);
+ 	m_nPrimOfsX = offset.GetX();
+ 	m_nPrimOfsY = offset.GetY();
++	if(m_drawFramebuffer) m_drawFramebuffer->CountDrawOfsY(m_nPrimOfsY);
+ 
+ 	CHECKGLERROR();
+ 
+@@ -1040,6 +1090,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 	assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+ 
+ 	m_renderState.framebufferHandle = framebuffer->m_framebuffer;
++	m_drawFramebuffer = framebuffer.get();
+ 	m_validGlState |= GLSTATE_FRAMEBUFFER; //glBindFramebuffer used to set just above
+ 
+ 	//We assume that we will be drawing to this framebuffer and that we'll need
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 290deb7..abd6a03 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -247,6 +247,58 @@ private:
+ 		Framework::OpenGl::CRenderbuffer m_colorBufferMs;
+ 
+ 		CGsCachedArea m_cachedArea;
++
++		//The XYOFFSET.OFY (in pixels) the primitives drawn into this buffer since it was
++		//last shown used, as a small histogram, and the one most of them used the last time
++		//it was shown. A game that renders in field mode draws its odd field with the
++		//offset moved half a line (the PS2 SDK's sceGsSetHalfOffset), so that field's
++		//content sits half a line up in its buffer; FlipImpl uses the difference between
++		//the two fields' offsets to show them in the same place (see FieldPresentOffset).
++		//The most-used offset rather than the last one: a game may finish each field with
++		//an overlay drawn at a fixed offset, which says nothing about where the scene is.
++		struct DRAW_OFFSET_COUNT
++		{
++			float ofsY = 0;
++			uint32 count = 0;
++		};
++		static constexpr unsigned int DRAW_OFFSET_SLOTS = 4;
++		DRAW_OFFSET_COUNT m_drawOfsYHist[DRAW_OFFSET_SLOTS];
++		float m_drawOfsY = 0;
++		void CountDrawOfsY(float ofsY)
++		{
++			for(auto& slot : m_drawOfsYHist)
++			{
++				if((slot.count != 0) && (slot.ofsY == ofsY))
++				{
++					slot.count++;
++					return;
++				}
++			}
++			for(auto& slot : m_drawOfsYHist)
++			{
++				if(slot.count == 0)
++				{
++					slot.ofsY = ofsY;
++					slot.count = 1;
++					return;
++				}
++			}
++			//More than four offsets in one field: the first slot stands for the rest.
++			m_drawOfsYHist[0].count++;
++		}
++		void SettleDrawOfsY()
++		{
++			uint32 best = 0;
++			for(auto& slot : m_drawOfsYHist)
++			{
++				if(slot.count > best)
++				{
++					best = slot.count;
++					m_drawOfsY = slot.ofsY;
++				}
++				slot.count = 0;
++			}
++		}
+ 	};
+ 	typedef std::shared_ptr<CFramebuffer> FramebufferPtr;
+ 	typedef std::vector<FramebufferPtr> FramebufferList;
+@@ -420,6 +472,20 @@ private:
+ 	Framework::OpenGl::CVertexArray m_presentVertexArray;
+ 	GLint m_presentTextureUniform = -1;
+ 	GLint m_presentTexCoordScaleUniform = -1;
++	GLint m_presentTexCoordOffsetUniform = -1;
++
++	//Field-mode presentation (interlaced + FFMD): each field is a half-height buffer the
++	//game drew with its own XYOFFSET, the odd one half a line up. Presenting both buffers
++	//the same way makes the picture bob by a line at the field rate; this shifts the
++	//field that was drawn higher back down by the difference, so both land in the same
++	//place. Which field is "higher" is read from the offsets themselves, not from the
++	//CSR field bit, so the game's own convention (top or bottom field first) doesn't
++	//matter.
++	CFramebuffer* m_drawFramebuffer = nullptr;   //the buffer primitives are going into (non-owning; m_framebuffers holds it)
++	float m_lastPresentedOfsY = 0;               //m_drawOfsY of the buffer the previous flip showed
++	float m_lastPresentedShift = 0;              //and how far down it was shown
++	bool m_lastPresentedOfsYValid = false;
++	float FieldPresentOffset(const FramebufferPtr&);
+ 
+ 	Framework::OpenGl::ProgramPtr m_copyToFbProgram;
+ 	Framework::OpenGl::CTexture m_copyToFbTexture;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+index 3f37572..8b242b3 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+@@ -662,9 +662,10 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GeneratePresentProgram()
+ 		shaderBuilder << "in vec2 a_texCoord;" << std::endl;
+ 		shaderBuilder << "out vec2 v_texCoord;" << std::endl;
+ 		shaderBuilder << "uniform vec2 g_texCoordScale;" << std::endl;
++		shaderBuilder << "uniform vec2 g_texCoordOffset;" << std::endl;
+ 		shaderBuilder << "void main()" << std::endl;
+ 		shaderBuilder << "{" << std::endl;
+-		shaderBuilder << "	v_texCoord = a_texCoord * g_texCoordScale;" << std::endl;
++		shaderBuilder << "	v_texCoord = a_texCoord * g_texCoordScale + g_texCoordOffset;" << std::endl;
+ 		shaderBuilder << "	gl_Position = vec4(a_position, 0, 1);" << std::endl;
+ 		shaderBuilder << "}" << std::endl;
+ 
