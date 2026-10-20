@@ -50,6 +50,12 @@ number GitHub shows on the asset).
     the source's pitch 0.2 % per half block of smoothed drift (1 % at most, inaudible),
     changing it only when the step changes; a queue ten blocks deep (the device paused)
     drops the block instead of adding to the delay.
+  - `0005-present-whole-frames.patch`: the GS thread's WebGL calls are proxied to the
+    main thread in batches and the browser composites the canvas between batches, so a
+    frame could be shown half drawn, the rest of it then drawn onto a buffer the
+    compositor had just cleared — flicker. The context is created with
+    `explicitSwapControl`, so rendering goes to an offscreen framebuffer, and
+    `PresentBackbuffer()` commits it to the canvas once per flip, whole.
 - One tweak to the SDK itself, made by the workflow before the build (`Widen Emscripten's
   OpenAL scheduling window`): Emscripten's `library_openal.js` never schedules more than
   100 ms of queued audio ahead of the clock, which would make the pre-buffer pointless —

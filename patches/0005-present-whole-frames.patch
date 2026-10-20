@@ -1,0 +1,35 @@
+diff --git a/Source/ui_js/GSH_OpenGLJs.cpp b/Source/ui_js/GSH_OpenGLJs.cpp
+index 5c98e96..683606b 100644
+--- a/Source/ui_js/GSH_OpenGLJs.cpp
++++ b/Source/ui_js/GSH_OpenGLJs.cpp
+@@ -1,4 +1,5 @@
+ #include "GSH_OpenGLJs.h"
++#include <emscripten/html5.h>
+ 
+ CGSH_OpenGLJs::CGSH_OpenGLJs(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context)
+     : m_context(context)
+@@ -23,4 +24,7 @@ void CGSH_OpenGLJs::ReleaseImpl()
+ 
+ void CGSH_OpenGLJs::PresentBackbuffer()
+ {
++	//The context was created with explicitSwapControl: the finished frame is in an
++	//offscreen framebuffer until this blits it to the canvas, whole.
++	emscripten_webgl_commit_frame();
+ }
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index d91c3b2..79ca082 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -45,6 +45,12 @@ extern "C" void initVm()
+ 	attr.majorVersion = 2;
+ 	attr.minorVersion = 0;
+ 	attr.alpha = false;
++	//The GS thread's GL calls are proxied to the main thread in batches, and the browser
++	//composites the canvas between batches, so without this a frame can be shown half
++	//drawn (and the rest drawn onto a buffer the compositor just cleared): flicker.
++	//Rendering goes to an offscreen framebuffer instead and reaches the canvas only when
++	//the GS presents a frame (CGSH_OpenGLJs::PresentBackbuffer).
++	attr.explicitSwapControl = 1;
+ 	g_context = emscripten_webgl_create_context("#outputCanvas", &attr);
+ 	assert(g_context >= 0);
+ 
