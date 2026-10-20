@@ -43,6 +43,13 @@ number GitHub shows on the asset).
     late block is an audible gap. In the browser the blocks are scheduled by the main
     thread, which is also proxying every WebGL call the GS makes, and it is late often.
     The source now waits for three queued blocks (~300 ms) before it (re)starts.
+  - `0004-openal-rate-control.patch`: the emulator's clock and the audio device's never
+    quite agree, and with the queue above never running dry the faster one wins — the
+    queue grew a block at a time until `MAX_BUFFERS` (2.5 s of delay between the game
+    and what you hear). The handler now holds the queue near its three blocks by nudging
+    the source's pitch 0.2 % per half block of smoothed drift (1 % at most, inaudible),
+    changing it only when the step changes; a queue ten blocks deep (the device paused)
+    drops the block instead of adding to the delay.
 - One tweak to the SDK itself, made by the workflow before the build (`Widen Emscripten's
   OpenAL scheduling window`): Emscripten's `library_openal.js` never schedules more than
   100 ms of queued audio ahead of the clock, which would make the pre-buffer pointless —

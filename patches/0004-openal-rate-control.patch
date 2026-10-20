@@ -1,0 +1,89 @@
+diff --git a/Source/sound/SH_OpenAL/SH_OpenAL.cpp b/Source/sound/SH_OpenAL/SH_OpenAL.cpp
+index a132570..d12dae0 100644
+--- a/Source/sound/SH_OpenAL/SH_OpenAL.cpp
++++ b/Source/sound/SH_OpenAL/SH_OpenAL.cpp
+@@ -1,6 +1,8 @@
+ #include "SH_OpenAL.h"
+ #include "alloca_def.h"
+ #include <assert.h>
++#include <algorithm>
++#include <cmath>
+ 
+ //#define LOGGING
+ #define SAMPLE_RATE 44100
+@@ -47,6 +49,10 @@ void CSH_OpenAL::Reset()
+ 	CHECK_AL_ERROR();
+ 	m_availableBuffers.clear();
+ 	m_availableBuffers.insert(m_availableBuffers.begin(), m_bufferNames, m_bufferNames + MAX_BUFFERS);
++	m_queueLevel = PREBUFFER_BLOCKS;
++	m_pitchStep = 0;
++	alSourcef(m_source, AL_PITCH, 1.0f);
++	CHECK_AL_ERROR();
+ }
+ 
+ void CSH_OpenAL::RecycleBuffers()
+@@ -76,6 +82,10 @@ void CSH_OpenAL::Write(int16* samples, unsigned int sampleCount, unsigned int sa
+ {
+ 	assert(m_availableBuffers.size() != 0);
+ 	if(m_availableBuffers.size() == 0) return;
++	ALint queued = 0;
++	alGetSourcei(m_source, AL_BUFFERS_QUEUED, &queued);
++	CHECK_AL_ERROR();
++	if(queued >= DROP_BLOCKS) return;
+ 	ALuint buffer = *m_availableBuffers.begin();
+ 	m_availableBuffers.pop_front();
+ 
+@@ -85,14 +95,28 @@ void CSH_OpenAL::Write(int16* samples, unsigned int sampleCount, unsigned int sa
+ 	alSourceQueueBuffers(m_source, 1, &buffer);
+ 	CHECK_AL_ERROR();
+ 
++	queued++;
++
+ 	ALint sourceState = m_source.GetState();
+ 	if(sourceState != AL_PLAYING)
+ 	{
+-		ALint queued = 0;
+-		alGetSourcei(m_source, AL_BUFFERS_QUEUED, &queued);
+-		CHECK_AL_ERROR();
+ 		if(queued < PREBUFFER_BLOCKS) return;
+ 		m_source.Play();
+ 		assert(m_source.GetState() == AL_PLAYING);
+ 	}
++
++	//Hold the queue near PREBUFFER_BLOCKS. The emulator's clock and the audio device's never
++	//quite agree, and left alone the faster one wins: the queue either grows block by block
++	//until MAX_BUFFERS (2.5s of delay) or runs dry. The pitch is nudged 0.2% per half block
++	//the smoothed depth sits away from the target (1% at most, inaudible), and only when the
++	//step changes — the device reschedules its buffers on every change.
++	m_queueLevel += (static_cast<float>(queued) - m_queueLevel) * 0.05f;
++	int step = static_cast<int>(std::lround((m_queueLevel - PREBUFFER_BLOCKS) * 2.0f));
++	step = std::min(std::max(step, -5), 5);
++	if(step != m_pitchStep)
++	{
++		m_pitchStep = step;
++		alSourcef(m_source, AL_PITCH, 1.0f + 0.002f * static_cast<float>(step));
++		CHECK_AL_ERROR();
++	}
+ }
+diff --git a/Source/sound/SH_OpenAL/SH_OpenAL.h b/Source/sound/SH_OpenAL/SH_OpenAL.h
+index c8d352e..f12df5f 100644
+--- a/Source/sound/SH_OpenAL/SH_OpenAL.h
++++ b/Source/sound/SH_OpenAL/SH_OpenAL.h
+@@ -17,6 +17,9 @@ public:
+ 		//by the main thread, which is also proxying the GS's WebGL calls; with one block queued
+ 		//every late block is a gap. Three blocks (~300ms) ride out its pauses.
+ 		PREBUFFER_BLOCKS = 3,
++		//A queue this deep is a backlog (the device fell behind, or was paused): the block
++		//is dropped rather than added to the delay.
++		DROP_BLOCKS = 10,
+ 	};
+ 
+ 	CSH_OpenAL();
+@@ -41,5 +44,7 @@ private:
+ 	BufferList m_availableBuffers;
+ 	uint64 m_lastUpdateTime;
+ 	bool m_mustSync;
++	float m_queueLevel = PREBUFFER_BLOCKS;
++	int m_pitchStep = 0;
+ 	ALuint m_bufferNames[MAX_BUFFERS];
+ };
