@@ -38,6 +38,17 @@ number GitHub shows on the asset).
     to `Key1`…`Key9`, which no keyboard sends — `KeyboardEvent.code` for the number row is
     `Digit1`…`Digit9`. Bound to the real codes, so L1/L2/L3 and R1/R2/R3 work from a
     keyboard (1 2 3 and 8 9 0).
+  - `0003-openal-prebuffer.patch`: the sound handler queues one ~100 ms block at a time
+    and restarts the OpenAL source the moment it runs dry, so it has no slack at all: any
+    late block is an audible gap. In the browser the blocks are scheduled by the main
+    thread, which is also proxying every WebGL call the GS makes, and it is late often.
+    The source now waits for three queued blocks (~300 ms) before it (re)starts.
+- One tweak to the SDK itself, made by the workflow before the build (`Widen Emscripten's
+  OpenAL scheduling window`): Emscripten's `library_openal.js` never schedules more than
+  100 ms of queued audio ahead of the clock, which would make the pre-buffer pointless —
+  a main-thread pause longer than 100 ms is a gap however much is queued. It is raised to
+  500 ms. The step is pinned to the exact source text and fails if a new emsdk changes it;
+  the package step checks the value reached `Play.js`.
 
 ## Releasing
 

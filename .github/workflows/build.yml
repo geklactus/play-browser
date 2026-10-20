@@ -69,6 +69,20 @@ jobs:
         with:
           version: ${{ steps.pins.outputs.emsdk }}
 
+      - name: Widen Emscripten's OpenAL scheduling window
+        # library_openal.js never schedules more than 100 ms of queued audio ahead of the
+        # clock, so a main-thread pause longer than that is a gap however much is queued —
+        # and in Play!'s browser build the main thread is also proxying the GS's WebGL.
+        # 500 ms, to cover the blocks patch 0003 holds back. Pinned to the exact text: a new
+        # emsdk that changes it fails here rather than silently building without it.
+        run: |
+          f="${EMSDK:?}/upstream/emscripten/src/library_openal.js"
+          if ! grep -q "QUEUE_LOOKAHEAD: 500.0 / 1000.0," "$f"; then
+            grep -q "QUEUE_LOOKAHEAD: 100.0 / 1000.0," "$f"
+            sed -i 's|QUEUE_LOOKAHEAD: 100.0 / 1000.0,|QUEUE_LOOKAHEAD: 500.0 / 1000.0,|' "$f"
+          fi
+          grep -n "QUEUE_LOOKAHEAD:" "$f"
+
       - name: Install ninja
         run: |
           sudo apt-get update -q
@@ -94,6 +108,7 @@ jobs:
           # Sanity: a wasm module, and the IDBFS patch took (the memory-card store needs it).
           [ "$(head -c4 "dist/$name/Play.wasm" | od -An -tx1 | tr -d ' \n')" = "0061736d" ]
           grep -q "IDBFS" "dist/$name/Play.js"
+          grep -Eq "QUEUE_LOOKAHEAD:0?\.5\b" "dist/$name/Play.js"   # the OpenAL window tweak landed
           cp play/License.txt "dist/$name/LICENSE-Play.txt"
           {
             echo "play-browser $ver"
@@ -101,6 +116,7 @@ jobs:
             echo "play-source: https://github.com/jpd002/Play-/tree/${{ steps.pins.outputs.commit }}"
             echo "emsdk: ${{ steps.pins.outputs.emsdk }}"
             echo "patches:"; ls patches/*.patch 2>/dev/null | sed 's/^/  /'
+            echo "emsdk tweaks:"; echo "  library_openal.js QUEUE_LOOKAHEAD 0.1 -> 0.5 s"
             echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ) by ${{ github.repository }} run ${{ github.run_id }}"
           } > "dist/$name/MANIFEST"
           (cd "dist/$name" && sha256sum Play.js Play.wasm > SHA256SUMS)
