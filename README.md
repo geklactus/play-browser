@@ -56,6 +56,19 @@ number GitHub shows on the asset).
     compositor had just cleared — flicker. The context is created with
     `explicitSwapControl`, so rendering goes to an offscreen framebuffer, and
     `PresentBackbuffer()` commits it to the canvas once per flip, whole.
+  - `0006-field-present-offset.patch`: games that render in *field mode* (SMODE2
+    interlaced with FFMD set — Onimusha 2, for one) draw each field into its own
+    half-height buffer, the odd field with `XYOFFSET` moved half a line up (the SDK's
+    `sceGsSetHalfOffset`), so that on a TV its lines fall between the even field's.
+    Play! presents both buffers the same way, so the picture bobs by a line sixty times
+    a second. The renderer now keeps, per buffer, the offset most of the primitives
+    drawn into it since it was last shown used (most, not last: Onimusha 2 ends each
+    field with one quad at a fixed offset) and, in field mode, samples the field that
+    was drawn higher that much lower — the same "bob" deinterlacing other emulators
+    default to. Which field is the higher one is read from the offsets themselves, not
+    from the CSR field bit, so a game's own top-or-bottom-first convention doesn't
+    matter; frame mode and progressive output are untouched. Measured on Onimusha 2's
+    title and menu: 1.3–1.4 px of bob between fields before, under 0.2 px after.
 - One tweak to the SDK itself, made by the workflow before the build (`Widen Emscripten's
   OpenAL scheduling window`): Emscripten's `library_openal.js` never schedules more than
   100 ms of queued audio ahead of the clock, which would make the pre-buffer pointless —
