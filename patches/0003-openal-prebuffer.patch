@@ -1,0 +1,30 @@
+diff --git a/Source/sound/SH_OpenAL/SH_OpenAL.cpp b/Source/sound/SH_OpenAL/SH_OpenAL.cpp
+index b134e53..a132570 100644
+--- a/Source/sound/SH_OpenAL/SH_OpenAL.cpp
++++ b/Source/sound/SH_OpenAL/SH_OpenAL.cpp
+@@ -88,6 +88,10 @@ void CSH_OpenAL::Write(int16* samples, unsigned int sampleCount, unsigned int sa
+ 	ALint sourceState = m_source.GetState();
+ 	if(sourceState != AL_PLAYING)
+ 	{
++		ALint queued = 0;
++		alGetSourcei(m_source, AL_BUFFERS_QUEUED, &queued);
++		CHECK_AL_ERROR();
++		if(queued < PREBUFFER_BLOCKS) return;
+ 		m_source.Play();
+ 		assert(m_source.GetState() == AL_PLAYING);
+ 	}
+diff --git a/Source/sound/SH_OpenAL/SH_OpenAL.h b/Source/sound/SH_OpenAL/SH_OpenAL.h
+index faf0696..c8d352e 100644
+--- a/Source/sound/SH_OpenAL/SH_OpenAL.h
++++ b/Source/sound/SH_OpenAL/SH_OpenAL.h
+@@ -13,6 +13,10 @@ public:
+ 	enum
+ 	{
+ 		MAX_BUFFERS = 25,
++		//Blocks held before the source is (re)started. In the browser the audio is scheduled
++		//by the main thread, which is also proxying the GS's WebGL calls; with one block queued
++		//every late block is a gap. Three blocks (~300ms) ride out its pauses.
++		PREBUFFER_BLOCKS = 3,
+ 	};
+ 
+ 	CSH_OpenAL();
