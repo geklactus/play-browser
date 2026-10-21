@@ -69,6 +69,19 @@ number GitHub shows on the asset).
     from the CSR field bit, so a game's own top-or-bottom-first convention doesn't
     matter; frame mode and progressive output are untouched. Measured on Onimusha 2's
     title and menu: 1.3–1.4 px of bob between fields before, under 0.2 px after.
+  - `0007-framebuffer-redeclare-writeback.patch`: the renderer keeps one GL texture per
+    *declaration* of a piece of GS memory (base pointer, width, format), and drawing
+    updates the texture, never the memory. When a game declares the same memory again
+    with another width — Onimusha 2 plays its movies in 640-wide field buffers over the
+    512-wide ones its title and menus drew into — the new texture started from the
+    memory as it was before any of that drawing, and the rows the movie never redraws
+    (its letterbox bars) kept showing what had been uploaded there long before: pieces
+    of the title screen, at the wrong stride. Each framebuffer now remembers how many
+    rows have been drawn into it, and before a new framebuffer is created over memory
+    an existing one drew into, those rows are read back and written to GS memory the
+    way the hardware would hold them (pages a transfer wrote more recently are left
+    alone), so the new framebuffer starts from them. Only 32-bit buffers are written
+    back; a one-time read-back per new buffer geometry, nothing per frame.
 - One tweak to the SDK itself, made by the workflow before the build (`Widen Emscripten's
   OpenAL scheduling window`): Emscripten's `library_openal.js` never schedules more than
   100 ms of queued audio ahead of the clock, which would make the pre-buffer pointless —

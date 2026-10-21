@@ -1,0 +1,144 @@
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index f52ec07..3357524 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -162,6 +162,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 
+ 		if(!framebuffer && (dispLayer.bufWidth != 0))
+ 		{
++			FlushOverlappingFramebuffersToRam(dispLayer.bufPtr, dispLayer.bufWidth, dispLayer.psm);
+ 			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, FRAMEBUFFER_HEIGHT, dispLayer.psm, m_fbScale, m_multisampleEnabled));
+ 			m_framebuffers.push_back(framebuffer);
+ 			PopulateFramebuffer(framebuffer);
+@@ -1066,6 +1067,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 	auto framebuffer = FindFramebuffer(frame);
+ 	if(!framebuffer)
+ 	{
++		FlushOverlappingFramebuffersToRam(frame.GetBasePtr(), frame.GetWidth(), frame.nPsm);
+ 		framebuffer = FramebufferPtr(new CFramebuffer(frame.GetBasePtr(), frame.GetWidth(), FRAMEBUFFER_HEIGHT, frame.nPsm, m_fbScale, m_multisampleEnabled));
+ 		m_framebuffers.push_back(framebuffer);
+ 		PopulateFramebuffer(framebuffer);
+@@ -1763,6 +1765,19 @@ void CGSH_OpenGL::FlushVertexBuffer()
+ 
+ 	assert(m_renderState.isValid == true);
+ 
++	if(m_drawFramebuffer)
++	{
++		float maxY = 0;
++		for(const auto& vertex : m_vertexBuffer)
++		{
++			maxY = std::max(maxY, vertex.y);
++		}
++		uint32 rows = static_cast<uint32>(std::ceil(maxY));
++		rows = std::min<uint32>(rows, static_cast<uint32>(std::max(0, m_renderState.scissorY + m_renderState.scissorHeight)));
++		rows = std::min<uint32>(rows, m_drawFramebuffer->m_height);
++		m_drawFramebuffer->m_drawnHeight = std::max(m_drawFramebuffer->m_drawnHeight, rows);
++	}
++
+ 	auto shader = GetShaderFromCaps(m_renderState.shaderCaps);
+ 	if(*shader != m_renderState.shaderHandle)
+ 	{
+@@ -2569,6 +2584,78 @@ void CGSH_OpenGL::PopulateFramebuffer(const FramebufferPtr& framebuffer)
+ 	CHECKGLERROR();
+ }
+ 
++//A framebuffer's texture holds what was drawn through one declaration of a piece of GS
++//memory (base pointer, width, format); the memory itself is not updated by drawing. When
++//a game declares the same memory again with another width or format - Onimusha 2 plays
++//its movies in 640-wide buffers over the 512-wide ones its menus drew into - the new
++//framebuffer would start from GS memory as it was before any of that drawing, and rows
++//the game never redraws (a movie's letterbox bars, for one) would keep showing it. So the
++//rows that were drawn into are written back to GS memory first, and the new framebuffer
++//starts from what the hardware would hold. Pages a transfer has written since the
++//texture was last updated hold newer data in memory than in the texture and are left
++//alone.
++void CGSH_OpenGL::FlushFramebufferToRam(const FramebufferPtr& framebuffer)
++{
++	if((framebuffer->m_psm != PSMCT32) && (framebuffer->m_psm != PSMCT24)) return;
++	uint32 rows = std::min<uint32>(framebuffer->m_drawnHeight, framebuffer->m_height);
++	if(rows == 0) return;
++
++	FlushVertexBuffer();
++	m_renderState.isValid = false;
++	m_validGlState &= ~(GLSTATE_SCISSOR | GLSTATE_FRAMEBUFFER);
++
++	uint32 width = framebuffer->m_width;
++	uint32 scale = m_fbScale;
++	std::vector<uint32> pixels(width * scale * rows * scale);
++
++	if(m_multisampleEnabled)
++	{
++		ResolveFramebufferMultisample(framebuffer, scale);
++		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer->m_resolveFramebuffer);
++	}
++	else
++	{
++		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer->m_framebuffer);
++	}
++	glReadPixels(0, 0, width * scale, rows * scale, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
++	CHECKGLERROR();
++
++	auto pageSize = CGsPixelFormats::GetPsmPageSize(framebuffer->m_psm);
++	uint32 pagesPerRow = (width + pageSize.first - 1) / pageSize.first;
++	CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, framebuffer->m_basePtr, width / 64);
++	for(uint32 y = 0; y < rows; y++)
++	{
++		uint32 pageY = y / pageSize.second;
++		const uint32* src = pixels.data() + (y * scale * width * scale);
++		for(uint32 x = 0; x < width; x++)
++		{
++			uint32 pageX = x / pageSize.first;
++			if(framebuffer->m_cachedArea.IsPageDirty((pageY * pagesPerRow) + pageX)) continue;
++			uint32 pixel = src[x * scale];
++			if(framebuffer->m_psm == PSMCT24)
++			{
++				pixel = (indexor.GetPixel(x, y) & 0xFF000000) | (pixel & 0x00FFFFFF);
++			}
++			indexor.SetPixel(x, y, pixel);
++		}
++	}
++
++	m_textureCache.InvalidateRange(framebuffer->m_basePtr, width * rows * 4);
++}
++
++void CGSH_OpenGL::FlushOverlappingFramebuffersToRam(uint32 basePtr, uint32 width, uint32 psm)
++{
++	uint32 newSize = width * FRAMEBUFFER_HEIGHT * (GetFramebufferBitDepth(psm) / 8);
++	for(const auto& framebuffer : m_framebuffers)
++	{
++		if(framebuffer->m_drawnHeight == 0) continue;
++		uint32 size = framebuffer->m_width * framebuffer->m_drawnHeight * (GetFramebufferBitDepth(framebuffer->m_psm) / 8);
++		bool overlap = (basePtr < (framebuffer->m_basePtr + size)) && (framebuffer->m_basePtr < (basePtr + newSize));
++		if(!overlap) continue;
++		FlushFramebufferToRam(framebuffer);
++	}
++}
++
+ void CGSH_OpenGL::CommitFramebufferDirtyPages(const FramebufferPtr& framebuffer, unsigned int minY, unsigned int maxY)
+ {
+ 	class CCopyToFbEnabler
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index abd6a03..0e9dc9b 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -248,6 +248,11 @@ private:
+ 
+ 		CGsCachedArea m_cachedArea;
+ 
++		//Rows that primitives have been drawn into through this buffer, which is what
++		//FlushFramebufferToRam writes back to GS memory when the same memory is declared
++		//again with another width or format.
++		uint32 m_drawnHeight = 0;
++
+ 		//The XYOFFSET.OFY (in pixels) the primitives drawn into this buffer since it was
+ 		//last shown used, as a small histogram, and the one most of them used the last time
+ 		//it was shown. A game that renders in field mode draws its odd field with the
+@@ -464,6 +469,8 @@ private:
+ 	void PalCache_Invalidate(uint32);
+ 
+ 	void PopulateFramebuffer(const FramebufferPtr&);
++	void FlushFramebufferToRam(const FramebufferPtr&);
++	void FlushOverlappingFramebuffersToRam(uint32, uint32, uint32);
+ 	void CommitFramebufferDirtyPages(const FramebufferPtr&, unsigned int, unsigned int);
+ 	void ResolveFramebufferMultisample(const FramebufferPtr&, uint32);
+ 
