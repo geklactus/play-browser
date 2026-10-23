@@ -1,0 +1,157 @@
+diff --git a/Source/Js_DiscImageDeviceStream.cpp b/Source/Js_DiscImageDeviceStream.cpp
+index 71d6051..0311add 100644
+--- a/Source/Js_DiscImageDeviceStream.cpp
++++ b/Source/Js_DiscImageDeviceStream.cpp
+@@ -1,9 +1,17 @@
+ #include "Js_DiscImageDeviceStream.h"
+ #include <stdexcept>
+ #include <cassert>
++#include <cstring>
++#include <algorithm>
+ #include <emscripten.h>
+ #include <unistd.h>
+ 
++//Every call into the page's discImageDevice is a synchronous call proxied to the main thread,
++//and the device's read is asynchronous, so a read used to cost one proxied call to start it and
++//one per 100us poll until it was done - per 2048-byte sector, since that's how the CDVD reads.
++//Reads now fetch a 64KB window and the following sectors come out of it; the poll backs off
++//(100us to 2ms) so a device that takes a while doesn't keep the main thread answering polls.
++
+ void CJsDiscImageDeviceStream::Seek(int64 position, Framework::STREAM_SEEK_DIRECTION whence)
+ {
+ 	switch(whence)
+@@ -15,12 +23,8 @@ void CJsDiscImageDeviceStream::Seek(int64 position, Framework::STREAM_SEEK_DIREC
+ 		m_position += position;
+ 		break;
+ 	case Framework::STREAM_SEEK_END:
+-	{
+-		uint32 positionLo = MAIN_THREAD_EM_ASM_INT({return Module.discImageDevice.getFileSize()});
+-		uint32 positionHi = MAIN_THREAD_EM_ASM_INT({return Module.discImageDevice.getFileSize() / 4294967296});
+-		m_position = static_cast<uint64>(positionLo) | (static_cast<uint64>(positionHi) << 32);
+-	}
+-	break;
++		m_position = GetFileSize() + position;
++		break;
+ 	}
+ }
+ 
+@@ -29,14 +33,28 @@ uint64 CJsDiscImageDeviceStream::Tell()
+ 	return m_position;
+ }
+ 
+-uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
++uint64 CJsDiscImageDeviceStream::GetFileSize()
+ {
+-	if(size == 0) return 0;
++	if(!m_fileSizeValid)
++	{
++		uint32 sizeLo = MAIN_THREAD_EM_ASM_INT({return Module.discImageDevice.getFileSize() >>> 0});
++		uint32 sizeHi = MAIN_THREAD_EM_ASM_INT({return Math.floor(Module.discImageDevice.getFileSize() / 4294967296)});
++		m_fileSize = static_cast<uint64>(sizeLo) | (static_cast<uint64>(sizeHi) << 32);
++		m_fileSizeValid = true;
++	}
++	return m_fileSize;
++}
+ 
++void CJsDiscImageDeviceStream::FetchWindow(uint64 position, uint32 size)
++{
+ 	assert(size <= std::numeric_limits<uint32>::max());
++	if(m_window.size() < size)
++	{
++		m_window.resize(size);
++	}
+ 
+-	uint32 positionLow = static_cast<uint32>(m_position);
+-	uint32 positionHigh = static_cast<uint32>(m_position >> 32);
++	uint32 positionLow = static_cast<uint32>(position);
++	uint32 positionHigh = static_cast<uint32>(position >> 32);
+ 
+ 	MAIN_THREAD_EM_ASM({
+ 		let posLow = $1 >>> 0;
+@@ -44,12 +62,49 @@ uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
+ 		let position = posLow + (posHigh * 4294967296);
+ 		Module.discImageDevice.read($0, position, $3);
+ 	},
+-	                   buffer, positionLow, positionHigh, static_cast<uint32>(size));
++	                   m_window.data(), positionLow, positionHigh, size);
++	unsigned int delay = 100;
+ 	while(!MAIN_THREAD_EM_ASM_INT({return Module.discImageDevice.isDone()}))
+ 	{
+-		usleep(100);
++		usleep(delay);
++		delay = std::min<unsigned int>(delay * 2, 2000);
+ 	}
+-	m_position += size;
++
++	m_windowStart = position;
++	m_windowSize = size;
++}
++
++uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
++{
++	if(size == 0) return 0;
++
++	uint64 fileSize = GetFileSize();
++	if(m_position >= fileSize) return 0;
++	size = std::min<uint64>(size, fileSize - m_position);
++
++	auto dst = reinterpret_cast<uint8*>(buffer);
++	uint64 remaining = size;
++	while(remaining != 0)
++	{
++		if((m_position < m_windowStart) || (m_position >= (m_windowStart + m_windowSize)))
++		{
++			//Not in the window: fetch one that starts at this sector and covers the rest of
++			//the request, or READAHEAD_SIZE, whichever is more (and no more than the file).
++			uint64 windowStart = m_position & ~static_cast<uint64>(SECTOR_SIZE - 1);
++			uint64 windowEnd = std::max<uint64>(windowStart + READAHEAD_SIZE, m_position + remaining);
++			windowEnd = (windowEnd + (SECTOR_SIZE - 1)) & ~static_cast<uint64>(SECTOR_SIZE - 1);
++			windowEnd = std::min<uint64>(windowEnd, fileSize);
++			FetchWindow(windowStart, static_cast<uint32>(windowEnd - windowStart));
++		}
++
++		uint64 windowOffset = m_position - m_windowStart;
++		uint64 chunk = std::min<uint64>(remaining, m_windowSize - windowOffset);
++		memcpy(dst, m_window.data() + windowOffset, chunk);
++		dst += chunk;
++		m_position += chunk;
++		remaining -= chunk;
++	}
++
+ 	return size;
+ }
+ 
+diff --git a/Source/Js_DiscImageDeviceStream.h b/Source/Js_DiscImageDeviceStream.h
+index 0702672..ef832d0 100644
+--- a/Source/Js_DiscImageDeviceStream.h
++++ b/Source/Js_DiscImageDeviceStream.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <vector>
+ #include "Stream.h"
+ 
+ class CJsDiscImageDeviceStream : public Framework::CStream
+@@ -15,5 +16,22 @@ public:
+ 	void Flush() override;
+ 
+ private:
++	enum
++	{
++		//Reads from the page's device are fetched in windows this big (a multiple of the
++		//2048-byte sector) and served from the window while the game reads on sequentially.
++		READAHEAD_SIZE = 64 * 1024,
++		SECTOR_SIZE = 2048,
++	};
++
++	uint64 GetFileSize();
++	void FetchWindow(uint64, uint32);
++
+ 	uint64 m_position = 0;
++	uint64 m_fileSize = 0;
++	bool m_fileSizeValid = false;
++
++	std::vector<uint8> m_window;
++	uint64 m_windowStart = 0;
++	uint32 m_windowSize = 0;
+ };

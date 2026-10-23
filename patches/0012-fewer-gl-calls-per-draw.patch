@@ -1,0 +1,208 @@
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index c5c9ddd..8ccc649 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -115,6 +115,7 @@ void CGSH_OpenGL::ResetImpl()
+ 	m_textureCache.Flush();
+ 	PalCache_Flush();
+ 	FlushTextureNameDeletes();
++	m_textureParams.clear();
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
+ 	m_vertexBuffer.clear();
+@@ -210,13 +211,11 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 
+ 		glActiveTexture(GL_TEXTURE1);
+ 		glBindTexture(GL_TEXTURE_2D, 0);
++		m_boundPaletteHandle = 0;
+ 
+ 		glActiveTexture(GL_TEXTURE0);
+ 		glBindTexture(GL_TEXTURE_2D, framebuffer->m_texture);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++		SetTextureParameters(framebuffer->m_texture, GL_LINEAR, GL_LINEAR, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+ 
+ 		glUseProgram(*m_presentProgram);
+ 
+@@ -314,6 +313,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
+ 	m_textureCache.Flush();
+ 	PalCache_Flush();
+ 	FlushTextureNameDeletes();
++	m_textureParams.clear();
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
+ 	m_drawFramebuffer = nullptr;
+@@ -1799,6 +1799,32 @@ void CGSH_OpenGL::FlushVertexBuffer()
+ 	m_vertexBuffer.clear();
+ }
+ 
++void CGSH_OpenGL::SetTextureParameters(GLuint textureHandle, GLint minFilter, GLint magFilter, GLint wrapS, GLint wrapT)
++{
++	//For the texture bound to the active unit.
++	auto& params = m_textureParams[textureHandle];
++	if(params.minFilter != minFilter)
++	{
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
++		params.minFilter = minFilter;
++	}
++	if(params.magFilter != magFilter)
++	{
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
++		params.magFilter = magFilter;
++	}
++	if(params.wrapS != wrapS)
++	{
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
++		params.wrapS = wrapS;
++	}
++	if(params.wrapT != wrapT)
++	{
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
++		params.wrapT = wrapT;
++	}
++}
++
+ void CGSH_OpenGL::DoRenderPass()
+ {
+ 	if((m_validGlState & GLSTATE_VERTEX_PARAMS) == 0)
+@@ -1865,19 +1891,24 @@ void CGSH_OpenGL::DoRenderPass()
+ 
+ 	if((m_validGlState & GLSTATE_TEXTURE) == 0)
+ 	{
+-		glActiveTexture(GL_TEXTURE0);
+-		glBindTexture(GL_TEXTURE_2D, m_renderState.texture0Handle);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_renderState.texture0MinFilter);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_renderState.texture0MagFilter);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, m_renderState.texture0WrapS);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m_renderState.texture0WrapT);
++		//Unit 0 is the active unit at all times (the texture updaters bind what they upload
++		//there); unit 1 holds the palette and is touched only when the palette changes. Palette
++		//textures get their sampling parameters when they are created.
++		if((m_renderState.texture1Handle != 0) && (m_renderState.texture1Handle != m_boundPaletteHandle))
++		{
++			glActiveTexture(GL_TEXTURE1);
++			glBindTexture(GL_TEXTURE_2D, m_renderState.texture1Handle);
++			glActiveTexture(GL_TEXTURE0);
++			m_boundPaletteHandle = m_renderState.texture1Handle;
++		}
+ 
+-		glActiveTexture(GL_TEXTURE1);
+-		glBindTexture(GL_TEXTURE_2D, m_renderState.texture1Handle);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++		glBindTexture(GL_TEXTURE_2D, m_renderState.texture0Handle);
++		if(m_renderState.texture0Handle != 0)
++		{
++			SetTextureParameters(m_renderState.texture0Handle,
++			                     m_renderState.texture0MinFilter, m_renderState.texture0MagFilter,
++			                     m_renderState.texture0WrapS, m_renderState.texture0WrapT);
++		}
+ 
+ 		m_validGlState |= GLSTATE_TEXTURE;
+ 	}
+@@ -1888,13 +1919,23 @@ void CGSH_OpenGL::DoRenderPass()
+ 		m_validGlState |= GLSTATE_FRAMEBUFFER;
+ 	}
+ 
+-	glBindBufferBase(GL_UNIFORM_BUFFER, 0, m_vertexParamsBuffer);
+-	glBindBufferBase(GL_UNIFORM_BUFFER, 1, m_fragmentParamsBuffer);
++	//The uniform block bindings and the vertex array only ever change in CopyToFb and FlipImpl,
++	//which invalidate them; nothing else needs them rebound on every draw.
++	if((m_validGlState & GLSTATE_UNIFORM_BINDINGS) == 0)
++	{
++		glBindBufferBase(GL_UNIFORM_BUFFER, 0, m_vertexParamsBuffer);
++		glBindBufferBase(GL_UNIFORM_BUFFER, 1, m_fragmentParamsBuffer);
++		m_validGlState |= GLSTATE_UNIFORM_BINDINGS;
++	}
+ 
+ 	glBindBuffer(GL_ARRAY_BUFFER, m_primBuffer);
+ 	glBufferData(GL_ARRAY_BUFFER, sizeof(PRIM_VERTEX) * m_vertexBuffer.size(), m_vertexBuffer.data(), GL_STREAM_DRAW);
+ 
+-	glBindVertexArray(m_primVertexArray);
++	if((m_validGlState & GLSTATE_VERTEX_ARRAY) == 0)
++	{
++		glBindVertexArray(m_primVertexArray);
++		m_validGlState |= GLSTATE_VERTEX_ARRAY;
++	}
+ 
+ 	GLenum primitiveMode = GL_NONE;
+ 	switch(m_primitiveType)
+@@ -1966,7 +2007,7 @@ void CGSH_OpenGL::CopyToFb(
+     int32 dstX0, int32 dstY0, int32 dstX1, int32 dstY1)
+ {
+ 	m_validGlState &= ~(GLSTATE_BLEND | GLSTATE_COLORMASK | GLSTATE_SCISSOR | GLSTATE_PROGRAM);
+-	m_validGlState &= ~(GLSTATE_VIEWPORT | GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK);
++	m_validGlState &= ~(GLSTATE_VIEWPORT | GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK | GLSTATE_VERTEX_ARRAY);
+ 
+ 	assert(srcX1 >= srcX0);
+ 	assert(srcY1 >= srcY0);
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 41e1693..34b826e 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -593,8 +593,24 @@ private:
+ 		GLSTATE_FRAMEBUFFER = 0x0100,
+ 		GLSTATE_VIEWPORT = 0x0200,
+ 		GLSTATE_DEPTHTEST = 0x0400,
++		GLSTATE_UNIFORM_BINDINGS = 0x0800,
++		GLSTATE_VERTEX_ARRAY = 0x1000,
+ 	};
+ 
++	//A texture object keeps its sampling parameters, so only the ones that differ from what was
++	//last set on it are sent (every GL call is proxied to the main thread in the browser build,
++	//and the old code sent eleven of them on each texture change, four of them to an empty unit).
++	struct TEXTURE_PARAMS
++	{
++		GLint minFilter = 0;
++		GLint magFilter = 0;
++		GLint wrapS = 0;
++		GLint wrapT = 0;
++	};
++	std::unordered_map<GLuint, TEXTURE_PARAMS> m_textureParams;
++	void SetTextureParameters(GLuint, GLint, GLint, GLint, GLint);
++	GLuint m_boundPaletteHandle = 0; //what texture unit 1 holds
++
+ 	ShaderMap m_shaders;
+ 	RENDERSTATE m_renderState;
+ 	uint32 m_validGlState = 0;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index 70d2dc1..af1799c 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -202,6 +202,7 @@ GLuint CGSH_OpenGL::AllocTextureName()
+ 	}
+ 	GLuint name = g_freeTextureNames.back();
+ 	g_freeTextureNames.pop_back();
++	m_textureParams.erase(name);
+ 	return name;
+ }
+ 
+@@ -216,7 +217,13 @@ void CGSH_OpenGL::FlushTextureNameDeletes()
+ 	if(g_pendingTextureDeletes.empty()) return;
+ 	glDeleteTextures(static_cast<GLsizei>(g_pendingTextureDeletes.size()), g_pendingTextureDeletes.data());
+ 	CHECKGLERROR();
++	for(auto name : g_pendingTextureDeletes)
++	{
++		m_textureParams.erase(name);
++	}
+ 	g_pendingTextureDeletes.clear();
++	//Deleting a texture unbinds it; the palette unit will be rebound at the next draw.
++	m_boundPaletteHandle = 0;
+ }
+ 
+ void CGSH_OpenGL::ClearTextureNamePool()
+@@ -320,6 +327,10 @@ GLuint CGSH_OpenGL::PreparePalette(const TEX0& tex0)
+ 	textureHandle = AllocTextureName();
+ 	glBindTexture(GL_TEXTURE_2D, textureHandle);
+ 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, entryCount, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, convertedClut.data());
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 
+ 	PalCache_Insert(tex0, convertedClut.data(), textureHandle);
+ 

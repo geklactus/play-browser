@@ -1,0 +1,127 @@
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index d527099..45298e9 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -214,7 +214,6 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+ 
+ 		glUseProgram(*m_presentProgram);
+ 
+@@ -625,10 +624,16 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	//--------------------------------------------------------
+ 	// Fast path: if everything (shader caps + relevant regs) matches, skip.
+ 	//--------------------------------------------------------
++	//texUseAlphaAsIndex is known only once the texture is prepared (SetupTexture sets it), so
++	//it is left out of the comparison here and carried over when the texture doesn't change.
++	auto prevShaderCaps = m_renderState.shaderCaps;
++	prevShaderCaps.texUseAlphaAsIndex = 0;
++	bool shaderCapsEqual = (static_cast<ShaderCapsInt>(prevShaderCaps) == static_cast<ShaderCapsInt>(shaderCaps));
++
+ 	if(m_renderState.isValid)
+ 	{
+ 		if(m_renderState.isTextureStateValid && m_renderState.isFramebufferStateValid &&
+-		   (static_cast<uint32>(m_renderState.shaderCaps) == static_cast<uint32>(shaderCaps)) &&
++		   shaderCapsEqual &&
+ 		   (m_renderState.primReg == primReg) &&
+ 		   (m_renderState.alphaReg == alphaReg) &&
+ 		   (m_renderState.testReg == testReg) &&
+@@ -655,7 +660,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	//--------------------------------------------------------
+ 	uint64 prevPrimValue = m_renderState.isValid ? m_renderState.primReg : 0;
+ 	auto prevPrim = make_convertible<PRMODE>(prevPrimValue);
+-	bool shaderChanged = !m_renderState.isValid || (static_cast<uint32>(m_renderState.shaderCaps) != static_cast<uint32>(shaderCaps));
++	bool shaderChanged = !m_renderState.isValid || !shaderCapsEqual;
+ 	bool primChanged = !m_renderState.isValid || (m_renderState.primReg != primReg);
+ 	bool blendEnableChanged = primChanged && !m_hasFramebufferFetchExtension && ((!m_renderState.isValid) || (prevPrim.nAlpha != prim.nAlpha));
+ 	bool alphaChanged = !m_renderState.isValid || (m_renderState.alphaReg != alphaReg);
+@@ -680,6 +685,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	//--------------------------------------------------------
+ 	if(shaderChanged)
+ 	{
++		shaderCaps.texUseAlphaAsIndex = textureChanged ? 0 : m_renderState.shaderCaps.texUseAlphaAsIndex;
+ 		m_renderState.shaderCaps = shaderCaps;
+ 	}
+ 
+@@ -1293,6 +1299,7 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+ 	m_renderState.texture0MagFilter = GL_NEAREST;
+ 	m_renderState.texture0WrapS = GL_CLAMP_TO_EDGE;
+ 	m_renderState.texture0WrapT = GL_CLAMP_TO_EDGE;
++	m_renderState.shaderCaps.texUseAlphaAsIndex = 0;
+ 	m_validGlState &= ~GLSTATE_TEXTURE;
+ 
+ 	auto prim = make_convertible<PRMODE>(primReg);
+@@ -1312,7 +1319,7 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+ 
+ 	auto texInfo = PrepareTexture(tex0);
+ 	m_renderState.texture0Handle = texInfo.textureHandle;
+-	m_renderState.texture0AlphaAsIndex = texInfo.alphaAsIndex;
++	m_renderState.shaderCaps.texUseAlphaAsIndex = texInfo.alphaAsIndex ? 1 : 0;
+ 
+ 	//Setup sampling modes
+ 	switch(tex1.nMagFilter)
+@@ -1860,7 +1867,6 @@ void CGSH_OpenGL::DoRenderPass()
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_renderState.texture0MagFilter);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, m_renderState.texture0WrapS);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m_renderState.texture0WrapT);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, m_renderState.texture0AlphaAsIndex ? GL_ALPHA : GL_RED);
+ 
+ 		glActiveTexture(GL_TEXTURE1);
+ 		glBindTexture(GL_TEXTURE_2D, m_renderState.texture1Handle);
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 0e9dc9b..93c98ab 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -80,6 +80,9 @@ private:
+ 		unsigned int texBilinearFilter : 1;
+ 		unsigned int texUseAlphaExpansion : 1;
+ 		unsigned int texBlackIsTransparent : 1;
++		//A PSMT8H texture read from a 32-bit framebuffer: the index is the alpha channel of the
++		//framebuffer's texture (GL_TEXTURE_SWIZZLE_R did this; WebGL 2 doesn't have it).
++		unsigned int texUseAlphaAsIndex : 1;
+ 		unsigned int hasFog : 1;
+ 
+ 		//Alpha blending caps
+@@ -136,7 +139,6 @@ private:
+ 		GLint texture0MagFilter;
+ 		GLint texture0WrapS;
+ 		GLint texture0WrapT;
+-		bool texture0AlphaAsIndex;
+ 		GLuint texture1Handle;
+ 		GLsizei viewportWidth;
+ 		GLsizei viewportHeight;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+index 8b242b3..413b01d 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+@@ -252,9 +252,12 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 	shaderBuilder << "	vec4 textureColor = vec4(1, 1, 1, 1);" << std::endl;
+ 	if(caps.isIndexedTextureSource())
+ 	{
++		//The index is the red channel of a GL_R8 texture, or the alpha channel of a 32-bit
++		//framebuffer's texture read as PSMT8H (what GL_TEXTURE_SWIZZLE_R used to redirect).
++		const char* idx = caps.texUseAlphaAsIndex ? "a" : "r";
+ 		if(!caps.texBilinearFilter)
+ 		{
+-			shaderBuilder << "	float colorIndex = texture(g_texture, texCoord.st).r * 255.0;" << std::endl;
++			shaderBuilder << "	float colorIndex = texture(g_texture, texCoord.st)." << idx << " * 255.0;" << std::endl;
+ 			if(caps.texSourceMode == TEXTURE_SOURCE_MODE_IDX4)
+ 			{
+ 				shaderBuilder << "	float paletteTexelBias = 0.5 / 16.0;" << std::endl;
+@@ -268,10 +271,10 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 		}
+ 		else
+ 		{
+-			shaderBuilder << "	float tlIdx = texture(g_texture, texCoord.st                                     ).r * 255.0;" << std::endl;
+-			shaderBuilder << "	float trIdx = texture(g_texture, texCoord.st + vec2(g_texelSize.x, 0)            ).r * 255.0;" << std::endl;
+-			shaderBuilder << "	float blIdx = texture(g_texture, texCoord.st + vec2(0, g_texelSize.y)            ).r * 255.0;" << std::endl;
+-			shaderBuilder << "	float brIdx = texture(g_texture, texCoord.st + vec2(g_texelSize.x, g_texelSize.y)).r * 255.0;" << std::endl;
++			shaderBuilder << "	float tlIdx = texture(g_texture, texCoord.st                                     )." << idx << " * 255.0;" << std::endl;
++			shaderBuilder << "	float trIdx = texture(g_texture, texCoord.st + vec2(g_texelSize.x, 0)            )." << idx << " * 255.0;" << std::endl;
++			shaderBuilder << "	float blIdx = texture(g_texture, texCoord.st + vec2(0, g_texelSize.y)            )." << idx << " * 255.0;" << std::endl;
++			shaderBuilder << "	float brIdx = texture(g_texture, texCoord.st + vec2(g_texelSize.x, g_texelSize.y))." << idx << " * 255.0;" << std::endl;
+ 
+ 			if(caps.texSourceMode == TEXTURE_SOURCE_MODE_IDX4)
+ 			{

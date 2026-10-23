@@ -1,0 +1,201 @@
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 45298e9..c5c9ddd 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -94,6 +94,7 @@ void CGSH_OpenGL::ReleaseImpl()
+ 	ResetImpl();
+ 
+ 	m_paletteCache.clear();
++	ClearTextureNamePool();
+ 	m_shaders.clear();
+ 	m_presentProgram.reset();
+ 	m_presentVertexBuffer.Reset();
+@@ -113,6 +114,7 @@ void CGSH_OpenGL::ResetImpl()
+ 	LoadPreferences();
+ 	m_textureCache.Flush();
+ 	PalCache_Flush();
++	FlushTextureNameDeletes();
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
+ 	m_vertexBuffer.clear();
+@@ -138,6 +140,7 @@ void CGSH_OpenGL::MarkNewFrame()
+ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ {
+ 	FlushVertexBuffer();
++	FlushTextureNameDeletes();
+ 	m_renderState.isValid = false;
+ 	m_validGlState = 0;
+ 
+@@ -310,6 +313,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
+ 	LoadPreferences();
+ 	m_textureCache.Flush();
+ 	PalCache_Flush();
++	FlushTextureNameDeletes();
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
+ 	m_drawFramebuffer = nullptr;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 93c98ab..af76f58 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <list>
++#include <utility>
+ #include <unordered_map>
+ #include "../GSHandler.h"
+ #include "../GsDebuggerInterface.h"
+@@ -67,7 +68,59 @@ protected:
+ 	GLuint m_presentFramebuffer = 0;
+ 
+ private:
+-	typedef CGsTextureCache<Framework::OpenGl::CTexture> TextureCache;
++	//GL texture names come from a pool and go back to one. In the browser build glGenTextures
++	//and glDeleteTextures are synchronous calls proxied to the main thread (the GS thread stops
++	//until the main thread has run everything queued before them), and the texture and palette
++	//caches create and destroy a texture on every miss. Names are generated 64 at a time, and
++	//released names are deleted together once per frame (or sooner if many pile up).
++	GLuint AllocTextureName();
++	static void ReleaseTextureName(GLuint);
++	void FlushTextureNameDeletes();
++	void ClearTextureNamePool();
++
++	//A texture name from the pool; the texture cache's handle type.
++	class CTextureName
++	{
++	public:
++		CTextureName() = default;
++		explicit CTextureName(GLuint handle)
++		    : m_handle(handle)
++		{
++		}
++		CTextureName(const CTextureName&) = delete;
++		CTextureName(CTextureName&& rhs)
++		{
++			std::swap(m_handle, rhs.m_handle);
++		}
++		~CTextureName()
++		{
++			Reset();
++		}
++		CTextureName& operator=(const CTextureName&) = delete;
++		CTextureName& operator=(CTextureName&& rhs)
++		{
++			Reset();
++			std::swap(m_handle, rhs.m_handle);
++			return (*this);
++		}
++		operator GLuint() const
++		{
++			return m_handle;
++		}
++		void Reset()
++		{
++			if(m_handle != 0)
++			{
++				ReleaseTextureName(m_handle);
++				m_handle = 0;
++			}
++		}
++
++	private:
++		GLuint m_handle = 0;
++	};
++
++	typedef CGsTextureCache<CTextureName> TextureCache;
+ 	typedef uint64 ShaderCapsInt;
+ 
+ 	struct SHADERCAPS : public convertible<ShaderCapsInt>
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index 01a1217..1cdfff0 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -3,6 +3,7 @@
+ #include <sys/stat.h>
+ #include <limits.h>
+ #include <algorithm>
++#include <vector>
+ #ifdef _WIN32
+ #include <intrin.h>
+ #endif
+@@ -183,6 +184,52 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+ 	}
+ }
+ 
++/////////////////////////////////////////////////////////////
++// Texture names
++/////////////////////////////////////////////////////////////
++
++static std::vector<GLuint> g_freeTextureNames;
++static std::vector<GLuint> g_pendingTextureDeletes;
++
++GLuint CGSH_OpenGL::AllocTextureName()
++{
++	if(g_freeTextureNames.empty())
++	{
++		static const unsigned int REFILL_COUNT = 64;
++		g_freeTextureNames.resize(REFILL_COUNT);
++		glGenTextures(REFILL_COUNT, g_freeTextureNames.data());
++		CHECKGLERROR();
++	}
++	GLuint name = g_freeTextureNames.back();
++	g_freeTextureNames.pop_back();
++	return name;
++}
++
++void CGSH_OpenGL::ReleaseTextureName(GLuint name)
++{
++	assert(name != 0);
++	g_pendingTextureDeletes.push_back(name);
++}
++
++void CGSH_OpenGL::FlushTextureNameDeletes()
++{
++	if(g_pendingTextureDeletes.empty()) return;
++	glDeleteTextures(static_cast<GLsizei>(g_pendingTextureDeletes.size()), g_pendingTextureDeletes.data());
++	CHECKGLERROR();
++	g_pendingTextureDeletes.clear();
++}
++
++void CGSH_OpenGL::ClearTextureNamePool()
++{
++	FlushTextureNameDeletes();
++	if(!g_freeTextureNames.empty())
++	{
++		glDeleteTextures(static_cast<GLsizei>(g_freeTextureNames.size()), g_freeTextureNames.data());
++		CHECKGLERROR();
++		g_freeTextureNames.clear();
++	}
++}
++
+ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+ {
+ 	auto texInfo = SearchTextureFramebuffer(tex0);
+@@ -204,7 +251,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+ 		auto texFormat = GetTextureFormatInfo(tex0.nPsm);
+ 
+ 		{
+-			auto textureHandle = Framework::OpenGl::CTexture::Create();
++			CTextureName textureHandle(AllocTextureName());
+ 			glBindTexture(GL_TEXTURE_2D, textureHandle);
+ 			glTexStorage2D(GL_TEXTURE_2D, 1, texFormat.internalFormat, texWidth, texHeight);
+ 			CHECKGLERROR();
+@@ -270,7 +317,7 @@ GLuint CGSH_OpenGL::PreparePalette(const TEX0& tex0)
+ 		return textureHandle;
+ 	}
+ 
+-	glGenTextures(1, &textureHandle);
++	textureHandle = AllocTextureName();
+ 	glBindTexture(GL_TEXTURE_2D, textureHandle);
+ 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, entryCount, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, convertedClut.data());
+ 
+@@ -700,7 +747,7 @@ void CGSH_OpenGL::CPalette::Free()
+ {
+ 	if(m_texture != 0)
+ 	{
+-		glDeleteTextures(1, &m_texture);
++		CGSH_OpenGL::ReleaseTextureName(m_texture);
+ 		m_texture = 0;
+ 		m_live = false;
+ 	}

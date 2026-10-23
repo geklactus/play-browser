@@ -1,0 +1,102 @@
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index af76f58..41e1693 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -424,6 +424,7 @@ private:
+ 	void InitializeRC();
+ 	void CheckExtensions();
+ 	void SetupTextureUpdaters();
++	static void TexSubImage2D(unsigned int, unsigned int, unsigned int, unsigned int, GLenum, GLenum, unsigned int, const void*);
+ 	virtual void PresentBackbuffer() = 0;
+ 	void MakeLinearZOrtho(float*, float, float, float, float);
+ 	TEXTURE_INFO PrepareTexture(const TEX0&);
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index 1cdfff0..70d2dc1 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -351,6 +351,31 @@ void CGSH_OpenGL::TexUpdater_Invalid(uint32 bufPtr, uint32 bufWidth, unsigned in
+ 	assert(0);
+ }
+ 
++//glTexSubImage2D on the bound GL_TEXTURE_2D. In the browser build Emscripten copies an
++//image smaller than 256KB and queues the upload, but runs a larger one synchronously: the GS
++//thread stops until the main thread has drained everything queued before it. A 256x256
++//32-bit texture is exactly 256KB, a 512x512 8-bit one too, and a movie frame several times
++//that. Uploads that size are split into bands of rows that each stay under the limit.
++void CGSH_OpenGL::TexSubImage2D(unsigned int texX, unsigned int texY, unsigned int texWidth, unsigned int texHeight, GLenum format, GLenum type, unsigned int bytesPerPixel, const void* pixels)
++{
++#ifdef __EMSCRIPTEN__
++	static const unsigned int MAX_ASYNC_UPLOAD_SIZE = 256 * 1024;
++	unsigned int rowSize = texWidth * bytesPerPixel;
++	if(((rowSize * texHeight) >= MAX_ASYNC_UPLOAD_SIZE) && (rowSize < MAX_ASYNC_UPLOAD_SIZE))
++	{
++		unsigned int rowsPerBand = (MAX_ASYNC_UPLOAD_SIZE - 1) / rowSize;
++		for(unsigned int y = 0; y < texHeight; y += rowsPerBand)
++		{
++			unsigned int rows = std::min(rowsPerBand, texHeight - y);
++			glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY + y, texWidth, rows, format, type,
++			                reinterpret_cast<const uint8*>(pixels) + (static_cast<size_t>(y) * rowSize));
++		}
++		return;
++	}
++#endif
++	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, format, type, pixels);
++}
++
+ void CGSH_OpenGL::TexUpdater_Psm32(uint32 bufPtr, uint32 bufWidth, unsigned int texX, unsigned int texY, unsigned int texWidth, unsigned int texHeight)
+ {
+ 	CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, bufPtr, bufWidth);
+@@ -366,7 +391,7 @@ void CGSH_OpenGL::TexUpdater_Psm32(uint32 bufPtr, uint32 bufWidth, unsigned int
+ 		dst += texWidth;
+ 	}
+ 
+-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_BYTE, m_pCvtBuffer);
++	TexSubImage2D(texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_BYTE, 4, m_pCvtBuffer);
+ 	CHECKGLERROR();
+ }
+ 
+@@ -392,7 +417,7 @@ void CGSH_OpenGL::TexUpdater_Psm16(uint32 bufPtr, uint32 bufWidth, unsigned int
+ 		dst += texWidth;
+ 	}
+ 
+-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, m_pCvtBuffer);
++	TexSubImage2D(texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, 2, m_pCvtBuffer);
+ 	CHECKGLERROR();
+ }
+ 
+@@ -637,7 +662,7 @@ void CGSH_OpenGL::TexUpdater_Psm8(uint32 bufPtr, uint32 bufWidth, unsigned int t
+ 		dst += texWidth * 16;
+ 	}
+ 
+-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
++	TexSubImage2D(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1, m_pCvtBuffer);
+ 	CHECKGLERROR();
+ }
+ 
+@@ -678,7 +703,7 @@ void CGSH_OpenGL::TexUpdater_Psm4(unsigned int bufPtr, unsigned int bufWidth, un
+ 
+ 		dst += texWidth * 16;
+ 	}
+-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
++	TexSubImage2D(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1, m_pCvtBuffer);
+ 	CHECKGLERROR();
+ }
+ 
+@@ -699,7 +724,7 @@ void CGSH_OpenGL::TexUpdater_Psm48(uint32 bufPtr, uint32 bufWidth, unsigned int
+ 		dst += texWidth;
+ 	}
+ 
+-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
++	TexSubImage2D(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1, m_pCvtBuffer);
+ 	CHECKGLERROR();
+ }
+ 
+@@ -721,7 +746,7 @@ void CGSH_OpenGL::TexUpdater_Psm48H(uint32 bufPtr, uint32 bufWidth, unsigned int
+ 		dst += texWidth;
+ 	}
+ 
+-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
++	TexSubImage2D(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1, m_pCvtBuffer);
+ 	CHECKGLERROR();
+ }
+ 

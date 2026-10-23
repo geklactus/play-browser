@@ -1,0 +1,28 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d4c2cf6..5fbe672 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,6 +15,14 @@ set(CMAKE_MODULE_PATH
+ )
+ include(Header)
+ 
++if(TARGET_PLATFORM_JS)
++	#The Wasm code generator already emits SIMD instructions, so the browser has to support
++	#them anyway; without this the C++ side (the NEON paths SimdDefs.h picks for Emscripten,
++	#through its SIMDe arm_neon.h) compiles to scalar emulation of each vector operation.
++	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msimd128")
++	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msimd128")
++endif()
++
+ set(BUILD_PLAY ON CACHE BOOL "Build Play! Emulator")
+ set(BUILD_PSFPLAYER OFF CACHE BOOL "Build PsfPlayer")
+ set(BUILD_TESTS ON CACHE BOOL "Build Tests")
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index 8a94b0c..f01b19f 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -68,3 +68,4 @@ target_link_options(Play PRIVATE "-sWASM_BIGINT")
+ target_link_options(Play PRIVATE "-sOFFSCREEN_FRAMEBUFFER=1")
+ target_link_options(Play PRIVATE "-sENVIRONMENT=web,worker")
+ target_link_options(Play PRIVATE "-sUSE_WEBGL2=1")
++target_link_options(Play PRIVATE "-msimd128")

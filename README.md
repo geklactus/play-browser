@@ -82,12 +82,71 @@ number GitHub shows on the asset).
     way the hardware would hold them (pages a transfer wrote more recently are left
     alone), so the new framebuffer starts from them. Only 32-bit buffers are written
     back; a one-time read-back per new buffer geometry, nothing per frame.
+  - `0008-shader-caps-compare-and-alpha-index.patch`: two renderer fixes. (1) The shader
+    permutation is chosen by a 64-bit set of capability bits, but the fast path that decides
+    whether the shader can stay the same between primitives compared only the low 32: the
+    alpha-test fail method (`TEST.AFAIL`: keep, colour only, depth only, RGB only) sits above
+    bit 31, so a game that changed only that between draws kept the previous shader — stray
+    or missing pixels and wrong depth writes on alpha-tested effects. All 64 bits are compared
+    now. (2) A PSMT8H texture read from a 32-bit framebuffer (the index is the alpha channel;
+    Yakuza does this) was wired through `GL_TEXTURE_SWIZZLE_R`, which WebGL 2 does not have:
+    the call raised `INVALID_ENUM` on every textured draw and every flip, and the shader read
+    the red channel. The swizzle is a shader capability now (`texUseAlphaAsIndex`), and the
+    swizzle calls are gone. Reproduced and verified with the test picture in `test/` (red
+    before, green after).
+  - `0009-texture-name-pool.patch`: in the browser build `glGenTextures` and `glDeleteTextures`
+    are *synchronous* calls proxied to the main thread — the GS thread stops until the main
+    thread has executed everything queued before them — and the texture and palette caches
+    did one of each on every miss. Names are now generated 64 at a time and released names
+    are deleted in one call per frame.
+  - `0010-chunk-large-texture-uploads.patch`: Emscripten copies and queues a `glTexSubImage2D`
+    under 256 KB but runs a larger one synchronously (same stall as above). A 256×256 32-bit
+    texture is exactly 256 KB, a 512×512 8-bit one too, a movie frame several times that.
+    Uploads that size are split into bands of rows that each stay under the limit.
+  - `0011-disc-read-ahead.patch`: each read from `Module.discImageDevice` cost one synchronous
+    main-thread call to start it and one per 100 µs poll until `isDone()` — per 2048-byte
+    sector, since that's how the disc layers read. The stream now fetches 64 KB windows
+    (2 KB-aligned, clamped to the file size) and serves the following sectors from the window;
+    the poll backs off from 100 µs to 2 ms. Booting the test image: 143 device reads of 2 KB
+    before, 5 reads of up to 64 KB after. **Page note:** `read()` may now be asked for sizes
+    up to 64 KB plus the request, not just 2048.
+  - `0012-fewer-gl-calls-per-draw.patch`: every GL call the GS thread makes is one message
+    for the main thread to execute, so their number is the main thread's cost. Per draw the
+    renderer rebound both uniform-block bases and the vertex array, and on each texture change
+    set eleven texture parameters — four of them on texture unit 1 with nothing bound, an
+    `INVALID_OPERATION` each (visible as console spam). Bindings are now tracked like the rest
+    of the GL state, a texture's sampling parameters are only sent when they change, palette
+    textures get theirs once when created, and unit 1 is touched only when the palette
+    changes. On the redraw loop in `test/`: 199 → 129 main-thread WebGL calls per frame, no
+    WebGL warnings.
+  - `0013-wasm-simd.patch`: `-msimd128`. `SimdDefs.h` picks the NEON paths for Emscripten,
+    which come from its SIMDe `arm_neon.h`: without the flag every vector operation (the
+    8- and 4-bit texture swizzle conversions, for one) compiles to scalar emulation. The Wasm
+    code generator already emits SIMD instructions, so nothing new is required of the browser.
 - One tweak to the SDK itself, made by the workflow before the build (`Widen Emscripten's
   OpenAL scheduling window`): Emscripten's `library_openal.js` never schedules more than
   100 ms of queued audio ahead of the clock, which would make the pre-buffer pointless —
   a main-thread pause longer than 100 ms is a gap however much is queued. It is raised to
   500 ms. The step is pinned to the exact source text and fails if a new emsdk changes it;
   the package step checks the value reached `Play.js`.
+
+## Testing a build
+
+`test/` holds a small end-to-end check that runs a build in headless Chromium: `mkelf.py`
+writes a PS2 ELF that draws a picture through the GS (untextured sprites, a 256 KB 32-bit
+texture, an 8-bit CLUT texture, and a sprite textured from an offscreen framebuffer read as
+PSMT8H), `mkiso.py` wraps it in an ISO9660 image so the disc device path is exercised too,
+`server.js` serves with the COOP/COEP headers, `run.js` drives Playwright and reports frames,
+main-thread WebGL calls and disc-device reads, and `analyze.py` samples the screenshot.
+
+```sh
+cd test && python3 mkelf.py www/test.elf && python3 mkelf.py www/test-loop.elf --loop
+python3 mkiso.py www/test.elf www/test.iso && cp /path/to/Play.js /path/to/Play.wasm www/
+node server.js www 8787 &
+NODE_PATH=$(npm root -g) node run.js "http://127.0.0.1:8787/?loop" shot.png 180 && python3 analyze.py shot.png
+```
+
+(`?loop` redraws every vertical blank, `?disc` boots from the ISO through `discImageDevice`.)
 
 ## Releasing
 

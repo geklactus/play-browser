@@ -1,0 +1,71 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Play! test</title>
+<style>body{margin:0;background:#333}canvas{display:block}</style></head>
+<body>
+<canvas id="outputCanvas" width="640" height="480"></canvas>
+<script>
+  // Count every WebGL call the main thread makes (the GS thread's calls are proxied here).
+  (() => {
+    const counts = {}; let total = 0;
+    const proto = WebGL2RenderingContext.prototype;
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      const d = Object.getOwnPropertyDescriptor(proto, name);
+      if (!d || typeof d.value !== 'function' || name === 'constructor') continue;
+      const orig = d.value;
+      proto[name] = function (...args) { total++; counts[name] = (counts[name] || 0) + 1; return orig.apply(this, args); };
+    }
+    window.__gl = { counts, get total() { return total; } };
+  })();
+</script>
+<script type="module">
+  import Play from './Play.js';
+  const log = [];
+  window.__log = log;
+  window.__ready = false;
+  try {
+    const t0 = performance.now();
+    const Module = await Play({
+      print: s => log.push('out: ' + s),
+      printErr: s => log.push('err: ' + s),
+      locateFile: p => './' + p,
+      mainScriptUrlOrBlob: new URL('./Play.js', location.href).href,
+    });
+    window.__Module = Module;
+    window.__initMs = performance.now() - t0;
+    const disc = location.search.includes('disc');
+    if (disc) {
+      // An in-memory disc image behind the page API the README documents; reads complete
+      // asynchronously (like a File would) so the emulator's polling path is exercised.
+      const iso = await (await fetch('./test.iso')).arrayBuffer();
+      const stats = { reads: 0, bytes: 0, maxSize: 0 };
+      window.__discStats = stats;
+      let done = true;
+      Module.discImageDevice = {
+        getFileSize() { return iso.byteLength; },
+        read(dstPtr, offset, size) {
+          done = false;
+          stats.reads++; stats.bytes += size; stats.maxSize = Math.max(stats.maxSize, size);
+          setTimeout(() => {
+            const n = Math.max(0, Math.min(size, iso.byteLength - offset));
+            Module.HEAPU8.set(new Uint8Array(iso, offset, n), dstPtr);
+            done = true;
+          }, 0);
+        },
+        isDone() { return done; },
+      };
+      Module.ccall('initVm', null, [], []);
+      Module.bootDiscImage('test.iso');
+    } else {
+      const elfName = location.search.includes('loop') ? './test-loop.elf' : './test.elf';
+      const elf = new Uint8Array(await (await fetch(elfName)).arrayBuffer());
+      Module.FS.writeFile('/test.elf', elf);
+      Module.ccall('initVm', null, [], []);
+      Module.bootElf('/test.elf');
+    }
+    window.__ready = true;
+  } catch (e) {
+    log.push('EXC: ' + (e && e.stack || e));
+    window.__error = String(e);
+  }
+</script>
+</body></html>
