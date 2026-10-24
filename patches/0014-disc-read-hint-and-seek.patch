@@ -1,0 +1,944 @@
+diff --git a/Source/ISO9660/BlockProvider.h b/Source/ISO9660/BlockProvider.h
+index 3ca3d52e..32fbb264 100644
+--- a/Source/ISO9660/BlockProvider.h
++++ b/Source/ISO9660/BlockProvider.h
+@@ -7,6 +7,21 @@
+ 
+ namespace ISO9660
+ {
++	//A stream that can be told which bytes are about to be read, so it can start getting them
++	//while the drive is (in emulated time) still busy. The browser build's disc comes over the
++	//network; any other stream just doesn't implement this.
++	class CReadHintTarget
++	{
++	public:
++		virtual ~CReadHintTarget() = default;
++		//[position, position + size) will be read soon. Must not block. source and seekUs are
++		//for the stream's statistics only: who is reading (see CCdvdman::READ_SOURCE) and how
++		//much of the drive time before the read is a seek.
++		virtual void HintRead(uint64 position, uint64 size, uint32 source, uint32 seekUs) = 0;
++		//Are [position, position + size) already at hand (a read of them won't wait)? Must not block.
++		virtual bool IsAtHand(uint64 position, uint64 size) = 0;
++	};
++
+ 	class CBlockProvider
+ 	{
+ 	public:
+@@ -20,6 +35,15 @@ namespace ISO9660
+ 		virtual void ReadMediaBlock(uint32, void*) = 0;
+ 		virtual uint32 GetBlockCount() = 0;
+ 		virtual uint32 GetMediaBlockSize() const = 0;
++		//Blocks [address, address + count) will be read soon (see CReadHintTarget)
++		virtual void HintRead(uint32 address, uint32 count, uint32 source, uint32 seekUs)
++		{
++		}
++		//...and are they at hand already (a stream that can't tell: always)
++		virtual bool IsAtHand(uint32 address, uint32 count)
++		{
++			return true;
++		}
+ 	};
+ 
+ 	class CBlockProvider2048 : public CBlockProvider
+@@ -56,6 +80,20 @@ namespace ISO9660
+ 			return BLOCKSIZE;
+ 		}
+ 
++		void HintRead(uint32 address, uint32 count, uint32 source, uint32 seekUs) override
++		{
++			if(auto target = dynamic_cast<CReadHintTarget*>(m_stream.get()))
++			{
++				target->HintRead(static_cast<uint64>(address + m_offset) * BLOCKSIZE, static_cast<uint64>(count) * BLOCKSIZE, source, seekUs);
++			}
++		}
++
++		bool IsAtHand(uint32 address, uint32 count) override
++		{
++			auto target = dynamic_cast<CReadHintTarget*>(m_stream.get());
++			return !target || target->IsAtHand(static_cast<uint64>(address + m_offset) * BLOCKSIZE, static_cast<uint64>(count) * BLOCKSIZE);
++		}
++
+ 	private:
+ 		StreamPtr m_stream;
+ 		uint32 m_offset = 0;
+@@ -100,6 +138,20 @@ namespace ISO9660
+ 			return MEDIA_BLOCKSIZE;
+ 		}
+ 
++		void HintRead(uint32 address, uint32 count, uint32 source, uint32 seekUs) override
++		{
++			if(auto target = dynamic_cast<CReadHintTarget*>(m_stream.get()))
++			{
++				target->HintRead(static_cast<uint64>(address) * INTERNAL_BLOCKSIZE, static_cast<uint64>(count) * INTERNAL_BLOCKSIZE, source, seekUs);
++			}
++		}
++
++		bool IsAtHand(uint32 address, uint32 count) override
++		{
++			auto target = dynamic_cast<CReadHintTarget*>(m_stream.get());
++			return !target || target->IsAtHand(static_cast<uint64>(address) * INTERNAL_BLOCKSIZE, static_cast<uint64>(count) * INTERNAL_BLOCKSIZE);
++		}
++
+ 	private:
+ 		StreamPtr m_stream;
+ 	};
+diff --git a/Source/ISO9660/File.cpp b/Source/ISO9660/File.cpp
+index 8894dacf..34d5d0ed 100644
+--- a/Source/ISO9660/File.cpp
++++ b/Source/ISO9660/File.cpp
+@@ -101,6 +101,24 @@ bool CFile::IsEOF()
+ 	return m_isEof;
+ }
+ 
++void CFile::GetReadBlocks(uint64 size, uint32& address, uint32& count) const
++{
++	uint64 start = m_start + m_position;
++	uint64 end = (m_end > start) ? std::min<uint64>(m_end - start, size) + start : start;
++	address = static_cast<uint32>(start / CBlockProvider::BLOCKSIZE);
++	count = (end > start) ? static_cast<uint32>(((end - 1) / CBlockProvider::BLOCKSIZE) - address + 1) : 0;
++}
++
++void CFile::HintRead(uint64 size, uint32 source, uint32 seekUs)
++{
++	uint32 address = 0, count = 0;
++	GetReadBlocks(size, address, count);
++	if(count != 0)
++	{
++		m_blockProvider->HintRead(address, count, source, seekUs);
++	}
++}
++
+ void CFile::InitBlock()
+ {
+ 	m_blockPosition = static_cast<uint32>(m_start / CBlockProvider::BLOCKSIZE);
+diff --git a/Source/ISO9660/File.h b/Source/ISO9660/File.h
+index 6f1ce623..61bc0bfb 100644
+--- a/Source/ISO9660/File.h
++++ b/Source/ISO9660/File.h
+@@ -17,6 +17,11 @@ namespace ISO9660
+ 		uint64 Write(const void*, uint64) override;
+ 		bool IsEOF() override;
+ 
++		//The blocks a Read of this many bytes from the current position would touch
++		//(count is 0 at the end of the file)
++		void GetReadBlocks(uint64 size, uint32& address, uint32& count) const;
++		void HintRead(uint64 size, uint32 source, uint32 seekUs);
++
+ 	private:
+ 		void InitBlock();
+ 		void SyncBlock();
+diff --git a/Source/ISO9660/ISO9660.h b/Source/ISO9660/ISO9660.h
+index 70d58fc6..0318fd6b 100644
+--- a/Source/ISO9660/ISO9660.h
++++ b/Source/ISO9660/ISO9660.h
+@@ -15,6 +15,14 @@ public:
+ 	~CISO9660();
+ 
+ 	void ReadBlock(uint32, void*);
++	void HintRead(uint32 address, uint32 count, uint32 source, uint32 seekUs)
++	{
++		m_blockProvider->HintRead(address, count, source, seekUs);
++	}
++	bool IsAtHand(uint32 address, uint32 count)
++	{
++		return m_blockProvider->IsAtHand(address, count);
++	}
+ 
+ 	Framework::CStream* Open(const char*);
+ 	Framework::CStream* OpenDirectory(const char*);
+diff --git a/Source/Js_DiscImageDeviceStream.cpp b/Source/Js_DiscImageDeviceStream.cpp
+index 0311addf..b0962825 100644
+--- a/Source/Js_DiscImageDeviceStream.cpp
++++ b/Source/Js_DiscImageDeviceStream.cpp
+@@ -11,6 +11,25 @@
+ //one per 100us poll until it was done - per 2048-byte sector, since that's how the CDVD reads.
+ //Reads now fetch a 64KB window and the following sectors come out of it; the poll backs off
+ //(100us to 2ms) so a device that takes a while doesn't keep the main thread answering polls.
++//The CDVD tells the stream what it is about to read when a read is issued (HintRead, passed
++//on to the page's discImageDevice.hint without waiting), and reads it when the drive's
++//modelled time is up; a read inside the hinted range is fetched in one window.
++
++CJsDiscImageDeviceStream::~CJsDiscImageDeviceStream()
++{
++	//The page writes into the presence map; it has to let go of it before the memory does
++	//(a VM reset makes a new stream). Waited for: no write can come after this returns.
++	if(!m_presence.empty())
++	{
++		MAIN_THREAD_EM_ASM({
++			const device = Module.discImageDevice;
++			if(device && device.presence)
++			{
++				device.presence(0, 0, 0);
++			}
++		});
++	}
++}
+ 
+ void CJsDiscImageDeviceStream::Seek(int64 position, Framework::STREAM_SEEK_DIRECTION whence)
+ {
+@@ -92,6 +111,11 @@ uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
+ 			//the request, or READAHEAD_SIZE, whichever is more (and no more than the file).
+ 			uint64 windowStart = m_position & ~static_cast<uint64>(SECTOR_SIZE - 1);
+ 			uint64 windowEnd = std::max<uint64>(windowStart + READAHEAD_SIZE, m_position + remaining);
++			if((m_position >= m_hintStart) && (m_position < m_hintEnd))
++			{
++				//The rest of a read the drive was told about: all of it at once
++				windowEnd = std::max<uint64>(windowEnd, std::min<uint64>(m_hintEnd, windowStart + HINTED_WINDOW_MAX));
++			}
+ 			windowEnd = (windowEnd + (SECTOR_SIZE - 1)) & ~static_cast<uint64>(SECTOR_SIZE - 1);
+ 			windowEnd = std::min<uint64>(windowEnd, fileSize);
+ 			FetchWindow(windowStart, static_cast<uint32>(windowEnd - windowStart));
+@@ -108,6 +132,64 @@ uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
+ 	return size;
+ }
+ 
++//The drive has been asked for [position, position + size) and will read it when its modelled
++//time is up (CCdvdman). Tell the page now, without waiting for it, so that it starts fetching
++//those bytes; by the time the read comes, they may be there. A page without hint() (an older
++//ps2.js) just doesn't hear about it.
++void CJsDiscImageDeviceStream::HintRead(uint64 position, uint64 size, uint32 source, uint32 seekUs)
++{
++	if(size == 0) return;
++	m_hintStart = position;
++	m_hintEnd = position + size;
++	MAIN_THREAD_ASYNC_EM_ASM({
++		const device = Module.discImageDevice;
++		if(device && device.hint)
++		{
++			device.hint(($0 >>> 0) + (($1 >>> 0) * 4294967296), $2 >>> 0, $3, $4 >>> 0);
++		}
++	},
++	                         static_cast<uint32>(position), static_cast<uint32>(position >> 32),
++	                         static_cast<uint32>(std::min<uint64>(size, 0xFFFFFFFFULL)), source, seekUs);
++}
++
++void CJsDiscImageDeviceStream::SharePresence()
++{
++	if(m_presenceAsked) return;
++	m_presenceAsked = true;
++	m_pageHasPresence = MAIN_THREAD_EM_ASM_INT({
++		const device = Module.discImageDevice;
++		return (device && (typeof device.presence === "function")) ? 1 : 0;
++	}) != 0;
++	if(!m_pageHasPresence) return;
++	uint64 count = (GetFileSize() + (1ULL << PRESENCE_SHIFT) - 1) >> PRESENCE_SHIFT;
++	m_presence.assign(std::max<uint64>(count, 1), 0);
++	MAIN_THREAD_ASYNC_EM_ASM({
++		const device = Module.discImageDevice;
++		if(device && device.presence)
++		{
++			device.presence($0, $1 >>> 0, $2);
++		}
++	},
++	                         m_presence.data(), static_cast<uint32>(m_presence.size()), static_cast<int>(PRESENCE_SHIFT));
++}
++
++//Does the page have every MiB of [position, position + size) at hand? A page that keeps the map:
++//not until it says so (so not in the first moments either). A page without presence(): yes.
++bool CJsDiscImageDeviceStream::IsAtHand(uint64 position, uint64 size)
++{
++	SharePresence();
++	if(!m_pageHasPresence) return true;
++	if(size == 0) return true;
++	uint64 first = position >> PRESENCE_SHIFT;
++	uint64 last = (position + size - 1) >> PRESENCE_SHIFT;
++	for(uint64 i = first; i <= last; i++)
++	{
++		if(i >= m_presence.size()) return false;
++		if(__atomic_load_n(&m_presence[i], __ATOMIC_RELAXED) == 0) return false;
++	}
++	return true;
++}
++
+ uint64 CJsDiscImageDeviceStream::Write(const void*, uint64)
+ {
+ 	throw std::runtime_error("Not supported.");
+diff --git a/Source/Js_DiscImageDeviceStream.h b/Source/Js_DiscImageDeviceStream.h
+index ef832d04..8a611db5 100644
+--- a/Source/Js_DiscImageDeviceStream.h
++++ b/Source/Js_DiscImageDeviceStream.h
+@@ -2,11 +2,12 @@
+ 
+ #include <vector>
+ #include "Stream.h"
++#include "ISO9660/BlockProvider.h"
+ 
+-class CJsDiscImageDeviceStream : public Framework::CStream
++class CJsDiscImageDeviceStream : public Framework::CStream, public ISO9660::CReadHintTarget
+ {
+ public:
+-	virtual ~CJsDiscImageDeviceStream() = default;
++	virtual ~CJsDiscImageDeviceStream();
+ 
+ 	void Seek(int64, Framework::STREAM_SEEK_DIRECTION) override;
+ 	uint64 Tell() override;
+@@ -15,6 +16,9 @@ public:
+ 	bool IsEOF() override;
+ 	void Flush() override;
+ 
++	void HintRead(uint64, uint64, uint32, uint32) override;
++	bool IsAtHand(uint64, uint64) override;
++
+ private:
+ 	enum
+ 	{
+@@ -22,7 +26,28 @@ private:
+ 		//2048-byte sector) and served from the window while the game reads on sequentially.
+ 		READAHEAD_SIZE = 64 * 1024,
+ 		SECTOR_SIZE = 2048,
++		//A read inside the range last hinted is fetched in one window up to the end of the
++		//range (no more than this): a CDVD read of N sectors is N block reads, and each window
++		//is a call proxied to the main thread and a wait for the page to answer.
++		HINTED_WINDOW_MAX = 1024 * 1024,
++	};
++
++	uint64 m_hintStart = 0;
++	uint64 m_hintEnd = 0;
++
++	//A byte per 1 MiB of the disc, in this module's memory, that the page sets while it has
++	//that MiB at hand (in memory or on the device) and clears when it no longer does. Made,
++	//and its address handed to the page (discImageDevice.presence), on the first question.
++	//A page without presence() keeps no map: its disc is taken to be at hand throughout
++	//(a local File, or a page from before the map), as any other stream's is.
++	enum
++	{
++		PRESENCE_SHIFT = 20,
+ 	};
++	void SharePresence();
++	bool m_presenceAsked = false;
++	bool m_pageHasPresence = false;
++	std::vector<uint8> m_presence;
+ 
+ 	uint64 GetFileSize();
+ 	void FetchWindow(uint64, uint32);
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 5c8ded91..d9ef4829 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -25,6 +25,7 @@
+ #include "PathUtils.h"
+ #include "ThreadUtils.h"
+ #include "iop/IopBios.h"
++#include "iop/Iop_Cdvdman.h"
+ #include "iop/ioman/HardDiskDevice.h"
+ #include "iop/ioman/OpticalMediaDevice.h"
+ #include "iop/ioman/PreferenceDirectoryDevice.h"
+@@ -93,6 +94,8 @@ CPS2VM::CPS2VM()
+ 	Framework::PathUtils::EnsurePathExists(GetStateDirectoryPath());
+ 
+ 	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE, true);
++	CAppConfig::GetInstance().RegisterPreferenceInteger(PREF_PS2_CDVD_SEEKTIME, Iop::CCdvdman::SEEK_FULLSTROKE_MS_DEFAULT);
++	CAppConfig::GetInstance().RegisterPreferenceBoolean(PREF_PS2_CDVD_SEEKALWAYS, false);
+ 	ReloadFrameRateLimit();
+ 
+ 	CAppConfig::GetInstance().RegisterPreferenceInteger(PREF_AUDIO_SPUBLOCKCOUNT, 100);
+diff --git a/Source/PS2VM_Preferences.h b/Source/PS2VM_Preferences.h
+index 3d6d6aeb..e0784e72 100644
+--- a/Source/PS2VM_Preferences.h
++++ b/Source/PS2VM_Preferences.h
+@@ -14,6 +14,13 @@
+ 
+ #define PREF_PS2_LIMIT_FRAMERATE ("ps2.limitframerate")
+ 
++//The CDVD's seek model: how long (ms) the drive takes to seek across a whole DVD layer; nearby
++//seeks take a fifth of it. 0: reads take no seek time (Play!'s behaviour before the model).
++#define PREF_PS2_CDVD_SEEKTIME ("ps2.cdvd.seektime")
++//By default a seek is only taken when the disc's stream doesn't have the sectors at hand (a
++//remote disc that would otherwise make the VM wait); true: on every read that seeks.
++#define PREF_PS2_CDVD_SEEKALWAYS ("ps2.cdvd.seekalways")
++
+ #define PREF_AUDIO_SPUBLOCKCOUNT ("audio.spublockcount")
+ 
+ #define PREF_SYSTEM_LANGUAGE ("system.language")
+diff --git a/Source/iop/Iop_Cdvdfsv.cpp b/Source/iop/Iop_Cdvdfsv.cpp
+index 57aa2dbd..000a27d6 100644
+--- a/Source/iop/Iop_Cdvdfsv.cpp
++++ b/Source/iop/Iop_Cdvdfsv.cpp
+@@ -438,8 +438,12 @@ void CCdvdfsv::Read(uint32* args, uint32 argsSize, uint32* ret, uint32 retSize,
+ 	}
+ 
+ 	assert(m_pendingCommand == COMMAND_NONE);
++	//The sectors are copied in FinishPendingCommand, when the drive time is up; the disc's
++	//stream hears about them now (see CCdvdman::MoveHead)
++	uint32 seekDelay = m_cdvdman.SeekForRead(sector, count);
++	CCdvdman::HintRead(m_opticalMedia, sector, count, CCdvdman::READ_SOURCE_FSV_READ, seekDelay);
+ 	m_pendingCommand = COMMAND_READ;
+-	m_pendingCommandDelay = CCdvdman::COMMAND_READ_BASE_DELAY + (count * CCdvdman::COMMAND_READ_SECTOR_DELAY);
++	m_pendingCommandDelay = CCdvdman::COMMAND_READ_BASE_DELAY + (count * CCdvdman::COMMAND_READ_SECTOR_DELAY) + seekDelay;
+ 	m_pendingReadSector = sector;
+ 	m_pendingReadCount = count;
+ 	m_pendingReadAddr = dstAddr & 0x1FFFFFFF;
+@@ -461,8 +465,10 @@ void CCdvdfsv::ReadIopMem(uint32* args, uint32 argsSize, uint32* ret, uint32 ret
+ 	}
+ 
+ 	assert(m_pendingCommand == COMMAND_NONE);
++	uint32 seekDelay = m_cdvdman.SeekForRead(sector, count);
++	CCdvdman::HintRead(m_opticalMedia, sector, count, CCdvdman::READ_SOURCE_FSV_READIOPMEM, seekDelay);
+ 	m_pendingCommand = COMMAND_READIOP;
+-	m_pendingCommandDelay = COMMAND_DEFAULT_DELAY;
++	m_pendingCommandDelay = COMMAND_DEFAULT_DELAY + seekDelay;
+ 	m_pendingReadSector = sector;
+ 	m_pendingReadCount = count;
+ 	m_pendingReadAddr = dstAddr & 0x1FFFFFFF;
+@@ -493,9 +499,12 @@ bool CCdvdfsv::StreamCmd(uint32* args, uint32 argsSize, uint32* ret, uint32 retS
+ 		m_streaming = true;
+ 		break;
+ 	case 2:
++	{
+ 		//Read
++		uint32 seekDelay = m_cdvdman.SeekForRead(m_streamPos, count);
++		CCdvdman::HintRead(m_opticalMedia, m_streamPos, count, CCdvdman::READ_SOURCE_FSV_STREAMREAD, seekDelay);
+ 		m_pendingCommand = COMMAND_STREAM_READ;
+-		m_pendingCommandDelay = COMMAND_DEFAULT_DELAY;
++		m_pendingCommandDelay = COMMAND_DEFAULT_DELAY + seekDelay;
+ 		m_pendingReadSector = 0;
+ 		m_pendingReadCount = count;
+ 		m_pendingReadAddr = dstAddr & (PS2::EE_RAM_SIZE - 1);
+@@ -503,7 +512,8 @@ bool CCdvdfsv::StreamCmd(uint32* args, uint32 argsSize, uint32* ret, uint32 retS
+ 		immediateReply = false;
+ 		CLog::GetInstance().Print(LOG_NAME, "StreamRead(count = 0x%08X, dest = 0x%08X);\r\n",
+ 		                          count, dstAddr);
+-		break;
++	}
++	break;
+ 	case 3:
+ 		//Stop
+ 		ret[0] = 1;
+@@ -583,6 +593,9 @@ void CCdvdfsv::ReadChain(uint32* args, uint32 argsSize, uint32* ret, uint32 retS
+ 		{
+ 			fileSystem->ReadBlock(sectorPos + sector, ram + (dstAddress + (sector * sectorSize)));
+ 		}
++		//Read right away (not when the command completes), so no hint and no seek time;
++		//the head still ends up there
++		m_cdvdman.MoveHead(sectorPos, sectorCount);
+ 	}
+ 
+ 	//DBZ: Budokai Tenkaichi hangs in its loading screen if this command's result is not delayed.
+diff --git a/Source/iop/Iop_Cdvdman.cpp b/Source/iop/Iop_Cdvdman.cpp
+index 71aed539..38acef75 100644
+--- a/Source/iop/Iop_Cdvdman.cpp
++++ b/Source/iop/Iop_Cdvdman.cpp
+@@ -3,6 +3,8 @@
+ #include "../states/RegisterStateFile.h"
+ #include "../Ps2Const.h"
+ #include "../TimeUtils.h"
++#include "../PS2VM_Preferences.h"
++#include "AppConfig.h"
+ #include "IopBios.h"
+ #include "Iop_Cdvdman.h"
+ 
+@@ -14,6 +16,10 @@
+ #define STATE_DISCCHANGED ("DiscChanged")
+ #define STATE_PENDING_COMMAND ("PendingCommand")
+ #define STATE_PENDING_COMMAND_DELAY ("PendingCommandDelay")
++#define STATE_PENDING_READ_SECTOR ("PendingReadSector")
++#define STATE_PENDING_READ_COUNT ("PendingReadCount")
++#define STATE_PENDING_READ_ADDR ("PendingReadAddr")
++#define STATE_HEAD_SECTOR ("HeadSector")
+ 
+ #define FUNCTION_CDINIT "CdInit"
+ #define FUNCTION_CDSTANDBY "CdStandby"
+@@ -56,6 +62,8 @@ CCdvdman::CCdvdman(CIopBios& bios, uint8* ram)
+     , m_ram(ram)
+ {
+ 	m_ilinkId.fill(0xAA);
++	m_seekFullStrokeMs = std::max<int>(0, CAppConfig::GetInstance().GetPreferenceInteger(PREF_PS2_CDVD_SEEKTIME));
++	m_seekAlways = CAppConfig::GetInstance().GetPreferenceBoolean(PREF_PS2_CDVD_SEEKALWAYS);
+ }
+ 
+ void CCdvdman::LoadState(Framework::CZipArchiveReader& archive)
+@@ -66,6 +74,11 @@ void CCdvdman::LoadState(Framework::CZipArchiveReader& archive)
+ 	m_discChanged = registerFile.GetRegister32(STATE_DISCCHANGED);
+ 	m_pendingCommand = static_cast<COMMAND>(registerFile.GetRegister32(STATE_PENDING_COMMAND));
+ 	m_pendingCommandDelay = registerFile.GetRegister32(STATE_PENDING_COMMAND_DELAY);
++	//(states saved before reads were copied at completion have none of these: 0, nothing to copy)
++	m_pendingReadSector = registerFile.GetRegister32(STATE_PENDING_READ_SECTOR);
++	m_pendingReadCount = registerFile.GetRegister32(STATE_PENDING_READ_COUNT);
++	m_pendingReadAddr = registerFile.GetRegister32(STATE_PENDING_READ_ADDR);
++	m_headSector = registerFile.GetRegister32(STATE_HEAD_SECTOR);
+ }
+ 
+ void CCdvdman::SaveState(Framework::CZipArchiveWriter& archive) const
+@@ -76,6 +89,10 @@ void CCdvdman::SaveState(Framework::CZipArchiveWriter& archive) const
+ 	registerFile->SetRegister32(STATE_DISCCHANGED, m_discChanged);
+ 	registerFile->SetRegister32(STATE_PENDING_COMMAND, m_pendingCommand);
+ 	registerFile->SetRegister32(STATE_PENDING_COMMAND_DELAY, m_pendingCommandDelay);
++	registerFile->SetRegister32(STATE_PENDING_READ_SECTOR, m_pendingReadSector);
++	registerFile->SetRegister32(STATE_PENDING_READ_COUNT, m_pendingReadCount);
++	registerFile->SetRegister32(STATE_PENDING_READ_ADDR, m_pendingReadAddr);
++	registerFile->SetRegister32(STATE_HEAD_SECTOR, m_headSector);
+ 	archive.InsertFile(std::move(registerFile));
+ }
+ 
+@@ -190,6 +207,58 @@ uint32 CCdvdman::CdLayerSearchFileDirect(COpticalMedia* opticalMedia, FILEINFO*
+ 	}
+ }
+ 
++//Reads used to copy their sectors into memory when they were issued and only then start the
++//modelled drive time (COMMAND_READ_BASE_DELAY + a sector delay per sector), so a disc that
++//takes a while to answer (the browser build reads it over the network) stopped the whole VM for
++//as long as it took, and the drive time came on top. Now a read tells the disc's stream which
++//sectors are coming the moment it's issued (HintRead: the page starts fetching them), and the
++//sectors are copied when the drive time is up: if they arrived meanwhile, nothing waits; if
++//not, only for what's left. The drive time also gets a seek (MoveHead) when a read doesn't carry
++//on from the previous one, as a real drive's would - and that is when a remote disc's bytes are
++//least likely to be at hand.
++uint32 CCdvdman::MoveHead(uint32 sector, uint32 count)
++{
++	uint32 from = m_headSector;
++	m_headSector = sector + count;
++	if((m_seekFullStrokeMs == 0) || (sector == from))
++	{
++		return 0;
++	}
++	uint64 nearUs = static_cast<uint64>(m_seekFullStrokeMs) * 1000 / 5;
++	uint64 farUs = static_cast<uint64>(m_seekFullStrokeMs) * 1000;
++	if((sector > from) && ((sector - from) <= SEEK_READTHROUGH_SECTORS))
++	{
++		//A few sectors ahead: the drive reads through them rather than seeking
++		uint64 throughCycles = static_cast<uint64>(sector - from) * COMMAND_READ_SECTOR_DELAY;
++		return static_cast<uint32>(std::min<uint64>(throughCycles, TimeUtils::UsecsToCycles(PS2::IOP_CLOCK_OVER_FREQ, nearUs)));
++	}
++	uint64 distance = (sector > from) ? (sector - from) : (from - sector);
++	distance = std::min<uint64>(distance, SEEK_DVD_LAYER_SECTORS);
++	uint64 seekUs = nearUs + ((farUs - nearUs) * distance / SEEK_DVD_LAYER_SECTORS);
++	return static_cast<uint32>(TimeUtils::UsecsToCycles(PS2::IOP_CLOCK_OVER_FREQ, seekUs));
++}
++
++uint32 CCdvdman::SeekForRead(uint32 sector, uint32 count)
++{
++	uint32 seek = MoveHead(sector, count);
++	if((seek != 0) && !m_seekAlways && m_opticalMedia && (count != 0) && m_opticalMedia->GetFileSystem()->IsAtHand(sector, count))
++	{
++		return 0;
++	}
++	return seek;
++}
++
++void CCdvdman::HintRead(COpticalMedia* opticalMedia, uint32 sector, uint32 count, uint32 source, uint32 seekCycles)
++{
++	if(!opticalMedia || (count == 0)) return;
++	opticalMedia->GetFileSystem()->HintRead(sector, count, source, CyclesToUsecs(seekCycles));
++}
++
++uint32 CCdvdman::CyclesToUsecs(uint64 cycles)
++{
++	return static_cast<uint32>((cycles * 1000000) / PS2::IOP_CLOCK_OVER_FREQ);
++}
++
+ std::string CCdvdman::GetId() const
+ {
+ 	return "cdvdman";
+@@ -411,6 +480,18 @@ void CCdvdman::CountTicks(uint32 ticks)
+ 			switch(m_pendingCommand)
+ 			{
+ 			case COMMAND_READ:
++				if(m_opticalMedia && (m_pendingReadCount != 0))
++				{
++					uint8* buffer = &m_ram[m_pendingReadAddr & (PS2::IOP_RAM_SIZE - 1)];
++					static const uint32 sectorSize = 2048;
++					auto fileSystem = m_opticalMedia->GetFileSystem();
++					for(unsigned int i = 0; i < m_pendingReadCount; i++)
++					{
++						fileSystem->ReadBlock(m_pendingReadSector + i, buffer);
++						buffer += sectorSize;
++					}
++				}
++				m_pendingReadCount = 0;
+ 				if(m_callbackPtr != 0)
+ 				{
+ 					m_bios.TriggerCallback(m_callbackPtr, CDVD_FUNCTION_READ);
+@@ -480,19 +561,18 @@ uint32 CCdvdman::CdRead(uint32 startSector, uint32 sectorCount, uint32 bufferPtr
+ 		//Does that make sure it's 2048 byte mode?
+ 		assert(mode[2] == 0);
+ 	}
++	uint32 seekDelay = SeekForRead(startSector, sectorCount);
++	m_pendingReadSector = startSector;
++	m_pendingReadCount = 0;
++	m_pendingReadAddr = bufferPtr;
+ 	if(m_opticalMedia && (bufferPtr != 0))
+ 	{
+-		uint8* buffer = &m_ram[bufferPtr & (PS2::IOP_RAM_SIZE - 1)];
+-		static const uint32 sectorSize = 2048;
+-		auto fileSystem = m_opticalMedia->GetFileSystem();
+-		for(unsigned int i = 0; i < sectorCount; i++)
+-		{
+-			fileSystem->ReadBlock(startSector + i, buffer);
+-			buffer += sectorSize;
+-		}
++		//Copied in CountTicks, when the drive is done
++		m_pendingReadCount = sectorCount;
++		HintRead(m_opticalMedia, startSector, sectorCount, READ_SOURCE_CDREAD, seekDelay);
+ 	}
+ 	m_pendingCommand = COMMAND_READ;
+-	m_pendingCommandDelay = COMMAND_READ_BASE_DELAY + (sectorCount * COMMAND_READ_SECTOR_DELAY);
++	m_pendingCommandDelay = COMMAND_READ_BASE_DELAY + (sectorCount * COMMAND_READ_SECTOR_DELAY) + seekDelay;
+ 	m_status = CDVD_STATUS_READING;
+ 	return 1;
+ }
+@@ -503,7 +583,13 @@ uint32 CCdvdman::CdSeek(uint32 sector)
+ 	                          sector);
+ 	assert(m_pendingCommand == COMMAND_NONE);
+ 	m_pendingCommand = COMMAND_SEEK;
+-	m_pendingCommandDelay = COMMAND_SEEK_DELAY;
++	//(the read that follows carries on from here: the seek is its seek, taken on the same terms)
++	uint32 seekDelay = MoveHead(sector, 0);
++	if((seekDelay != 0) && !m_seekAlways && m_opticalMedia && m_opticalMedia->GetFileSystem()->IsAtHand(sector, 1))
++	{
++		seekDelay = 0;
++	}
++	m_pendingCommandDelay = COMMAND_SEEK_DELAY + seekDelay;
+ 	return 1;
+ }
+ 
+@@ -636,6 +722,7 @@ uint32 CCdvdman::CdStRead(uint32 sectors, uint32 bufPtr, uint32 mode, uint32 err
+ 	CLog::GetInstance().Print(LOG_NAME, FUNCTION_CDSTREAD "(sectors = %d, bufPtr = 0x%08X, mode = %d, errPtr = 0x%08X);\r\n",
+ 	                          sectors, bufPtr, mode, errPtr);
+ 	auto fileSystem = m_opticalMedia->GetFileSystem();
++	MoveHead(m_streamPos, sectors); //(read right away: no seek time, but the head moves)
+ 	for(unsigned int i = 0; i < sectors; i++)
+ 	{
+ 		fileSystem->ReadBlock(m_streamPos, m_ram + (bufPtr + (i * 0x800)));
+diff --git a/Source/iop/Iop_Cdvdman.h b/Source/iop/Iop_Cdvdman.h
+index 51626209..87cc16f4 100644
+--- a/Source/iop/Iop_Cdvdman.h
++++ b/Source/iop/Iop_Cdvdman.h
+@@ -45,6 +45,17 @@ namespace Iop
+ 
+ 		using IlinkId = std::array<uint8, 8>;
+ 
++		//Who issued a read, for the disc stream's statistics (CReadHintTarget::HintRead)
++		enum READ_SOURCE : uint32
++		{
++			READ_SOURCE_CDREAD = 1,
++			READ_SOURCE_FSV_READ = 2,
++			READ_SOURCE_FSV_READIOPMEM = 3,
++			READ_SOURCE_FSV_STREAMREAD = 4,
++			READ_SOURCE_FSV_READCHAIN = 5,
++			READ_SOURCE_FILEIO = 6,
++		};
++
+ 		CCdvdman(CIopBios&, uint8*);
+ 		virtual ~CCdvdman() = default;
+ 
+@@ -71,10 +82,32 @@ namespace Iop
+ 		uint32 CdGetDiskTypeDirect(COpticalMedia*);
+ 		uint32 CdLayerSearchFileDirect(COpticalMedia*, FILEINFO*, const char*, uint32);
+ 
++		//The drive is shared by everything that reads the disc (cdvdman, cdvdfsv, fileio).
++		//MoveHead puts its head at the end of [sector, sector + count) and returns how long
++		//getting to sector takes, in IOP cycles (0 for a read that carries on from the last one,
++		//or with the seek model off). HintRead tells the disc's stream which blocks are coming.
++		uint32 MoveHead(uint32 sector, uint32 count);
++		//The seek a read of [sector, sector + count) takes: MoveHead's, unless the disc's stream
++		//has those sectors at hand already (then the head moves for nothing) - see SEEK_ALWAYS.
++		uint32 SeekForRead(uint32 sector, uint32 count);
++		static void HintRead(COpticalMedia*, uint32 sector, uint32 count, uint32 source, uint32 seekCycles);
++		static uint32 CyclesToUsecs(uint64);
++
+ 		static const uint64 COMMAND_READ_BASE_DELAY;
+ 		static const uint64 COMMAND_READ_SECTOR_DELAY;
+ 		static const uint64 COMMAND_SEEK_DELAY;
+ 
++		//The seek model: a read that doesn't carry on from the previous one costs a fifth of
++		//the full-stroke time (adjacent) up to all of it (a whole DVD layer away), linearly in
++		//the distance; a forward skip of a few sectors is read through instead. The full-stroke
++		//time is a preference in ms (0: no seeks, as before). It is taken only by a read whose
++		//sectors the disc's stream doesn't have at hand -- a remote disc's miss, which would
++		//otherwise stop the VM -- unless the "seek always" preference is set: on a fast link,
++		//seeking on every read made loading measurably slower.
++		static constexpr uint32 SEEK_DVD_LAYER_SECTORS = 2295104; //4.7 GB
++		static constexpr uint32 SEEK_READTHROUGH_SECTORS = 16;
++		static constexpr uint32 SEEK_FULLSTROKE_MS_DEFAULT = 150;
++
+ 	private:
+ 		enum COMMAND : uint32
+ 		{
+@@ -123,6 +156,15 @@ namespace Iop
+ 		uint32 m_streamBufferSize = 0;
+ 		COMMAND m_pendingCommand = COMMAND_NONE;
+ 		int32 m_pendingCommandDelay = 0;
++
++		//CdRead's sectors are copied when the command completes, not when it's issued
++		uint32 m_pendingReadSector = 0;
++		uint32 m_pendingReadCount = 0;
++		uint32 m_pendingReadAddr = 0;
++
++		uint32 m_headSector = 0;
++		uint32 m_seekFullStrokeMs = SEEK_FULLSTROKE_MS_DEFAULT;
++		bool m_seekAlways = false;
+ 	};
+ 
+ 	typedef std::shared_ptr<CCdvdman> CdvdmanPtr;
+diff --git a/Source/iop/Iop_FileIo.cpp b/Source/iop/Iop_FileIo.cpp
+index 034c8283..598d2b89 100644
+--- a/Source/iop/Iop_FileIo.cpp
++++ b/Source/iop/Iop_FileIo.cpp
+@@ -49,7 +49,7 @@ void CFileIo::SyncHandler()
+ 	}
+ 	else if(m_moduleVersion >= 2200)
+ 	{
+-		m_handler = std::make_unique<CFileIoHandler2200>(&m_ioman, m_sifMan);
++		m_handler = std::make_unique<CFileIoHandler2200>(&m_ioman, m_sifMan, m_bios);
+ 	}
+ 	else
+ 	{
+diff --git a/Source/iop/Iop_FileIoHandler2200.cpp b/Source/iop/Iop_FileIoHandler2200.cpp
+index 4da4d3e1..f153a4ce 100644
+--- a/Source/iop/Iop_FileIoHandler2200.cpp
++++ b/Source/iop/Iop_FileIoHandler2200.cpp
+@@ -3,6 +3,9 @@
+ #include "Iop_FileIoHandler2200.h"
+ #include "Iop_Ioman.h"
+ #include "Iop_SifManPs2.h"
++#include "Iop_Cdvdman.h"
++#include "IopBios.h"
++#include "ioman/OpticalMediaDevice.h"
+ #include "../states/RegisterStateFile.h"
+ #include "../states/MemoryStateFile.h"
+ #include "Log.h"
+@@ -14,14 +17,20 @@
+ #define STATE_RESULTPTR0 ("resultPtr0")
+ #define STATE_RESULTPTR1 ("resultPtr1")
+ #define STATE_PENDINGREPLY ("iop_fileio/state2200_pending")
++#define STATE_PENDINGREAD_VALID ("pendingReadValid")
++#define STATE_PENDINGREAD_FILEID ("pendingReadFileId")
++#define STATE_PENDINGREAD_SIZE ("pendingReadSize")
++#define STATE_PENDINGREAD_ADDRESS ("pendingReadAddress")
++#define STATE_PENDINGREAD_READYTIME ("pendingReadReadyTime")
+ 
+ using namespace Iop;
+ 
+ #define IOCTL_HDD_ADDSUB 0x6801
+ 
+-CFileIoHandler2200::CFileIoHandler2200(CIoman* ioman, CSifMan& sifMan)
++CFileIoHandler2200::CFileIoHandler2200(CIoman* ioman, CSifMan& sifMan, CIopBios& bios)
+     : CHandler(ioman)
+     , m_sifMan(sifMan)
++    , m_bios(bios)
+ {
+ 	memset(m_resultPtr, 0, sizeof(m_resultPtr));
+ 	memset(m_pendingReply.buffer.data(), 0, PENDINGREPLY::REPLY_BUFFER_SIZE);
+@@ -29,6 +38,11 @@ CFileIoHandler2200::CFileIoHandler2200(CIoman* ioman, CSifMan& sifMan)
+ 
+ bool CFileIoHandler2200::Invoke(uint32 method, uint32* args, uint32 argsSize, uint32* ret, uint32 retSize, uint8* ram)
+ {
++	//A read put off until its reply is done before anything else happens to the files
++	if(m_pendingRead.valid)
++	{
++		CompletePendingRead(ram);
++	}
+ 	switch(method)
+ 	{
+ 	case COMMANDID_OPEN:
+@@ -112,6 +126,12 @@ void CFileIoHandler2200::LoadState(Framework::CZipArchiveReader& archive)
+ 		auto registerFile = CRegisterStateFile(*archive.BeginReadFile(STATE_XML));
+ 		m_resultPtr[0] = registerFile.GetRegister32(STATE_RESULTPTR0);
+ 		m_resultPtr[1] = registerFile.GetRegister32(STATE_RESULTPTR1);
++		//(none of these in states saved before reads were put off: no read pending)
++		m_pendingRead.valid = registerFile.GetRegister32(STATE_PENDINGREAD_VALID) != 0;
++		m_pendingRead.fileId = registerFile.GetRegister32(STATE_PENDINGREAD_FILEID);
++		m_pendingRead.size = registerFile.GetRegister32(STATE_PENDINGREAD_SIZE);
++		m_pendingRead.address = registerFile.GetRegister32(STATE_PENDINGREAD_ADDRESS);
++		m_pendingRead.readyTime = registerFile.GetRegister64(STATE_PENDINGREAD_READYTIME);
+ 	}
+ 
+ 	archive.BeginReadFile(STATE_PENDINGREPLY)->Read(&m_pendingReply, sizeof(m_pendingReply));
+@@ -123,6 +143,11 @@ void CFileIoHandler2200::SaveState(Framework::CZipArchiveWriter& archive) const
+ 		auto registerFile = std::make_unique<CRegisterStateFile>(STATE_XML);
+ 		registerFile->SetRegister32(STATE_RESULTPTR0, m_resultPtr[0]);
+ 		registerFile->SetRegister32(STATE_RESULTPTR1, m_resultPtr[1]);
++		registerFile->SetRegister32(STATE_PENDINGREAD_VALID, m_pendingRead.valid ? 1 : 0);
++		registerFile->SetRegister32(STATE_PENDINGREAD_FILEID, m_pendingRead.fileId);
++		registerFile->SetRegister32(STATE_PENDINGREAD_SIZE, m_pendingRead.size);
++		registerFile->SetRegister32(STATE_PENDINGREAD_ADDRESS, m_pendingRead.address);
++		registerFile->SetRegister64(STATE_PENDINGREAD_READYTIME, m_pendingRead.readyTime);
+ 		archive.InsertFile(std::move(registerFile));
+ 	}
+ 
+@@ -136,6 +161,11 @@ void CFileIoHandler2200::ProcessCommands(CSifMan* sifMan)
+ {
+ 	if(m_pendingReply.valid)
+ 	{
++		if(m_pendingRead.valid && (m_bios.GetCurrentTime() < m_pendingRead.readyTime))
++		{
++			//The drive is still seeking: another frame
++			return;
++		}
+ 		uint8* eeRam = nullptr;
+ 		if(auto sifManPs2 = dynamic_cast<CSifManPs2*>(sifMan))
+ 		{
+@@ -201,24 +231,51 @@ uint32 CFileIoHandler2200::InvokeRead(uint32* args, uint32 argsSize, uint32* ret
+ 	assert(retSize == 4);
+ 	auto command = reinterpret_cast<READCOMMAND*>(args);
+ 	uint32 readAddress = command->buffer & (PS2::EE_RAM_SIZE - 1);
+-	auto result = m_ioman->Read(command->fd, command->size, reinterpret_cast<void*>(ram + readAddress));
+-
+-	READREPLY reply;
+-	reply.header.commandId = COMMANDID_READ;
+-	CopyHeader(reply.header, command->header);
+-	reply.result = result;
+-	reply.unknown2 = 0;
+-	reply.unknown3 = 0;
+-	reply.unknown4 = 0;
+ 
+ 	//If we have a pending reply for another file operation, just send that one right away.
+ 	//This can happen in Star Wars: Clone Wars when loading a specific level.
++	//(Before this read is put off below: the pending one is the other file's.)
+ 	if(m_pendingReply.valid && (m_pendingReply.fileId != command->fd))
+ 	{
+ 		SendPendingReply(ram);
+ 		assert(!m_pendingReply.valid);
+ 	}
+ 
++	//A file on the disc: tell the drive now, read when the reply goes out
++	Ioman::COpticalMediaFile* discFile = nullptr;
++	uint32 blockAddress = 0, blockCount = 0;
++	try
++	{
++		discFile = dynamic_cast<Ioman::COpticalMediaFile*>(m_ioman->GetFileStream(command->fd));
++	}
++	catch(const std::exception&)
++	{
++		//Not an open file: Read below says so
++	}
++	uint32 result = 0;
++	if(discFile && discFile->GetReadBlocks(command->size, blockAddress, blockCount) && (blockCount != 0) && m_bios.GetCdvdman())
++	{
++		uint32 seekDelay = m_bios.GetCdvdman()->SeekForRead(blockAddress, blockCount);
++		discFile->HintRead(command->size, CCdvdman::READ_SOURCE_FILEIO, CCdvdman::CyclesToUsecs(seekDelay));
++		m_pendingRead.valid = true;
++		m_pendingRead.fileId = command->fd;
++		m_pendingRead.size = command->size;
++		m_pendingRead.address = readAddress;
++		m_pendingRead.readyTime = m_bios.GetCurrentTime() + seekDelay;
++	}
++	else
++	{
++		result = m_ioman->Read(command->fd, command->size, reinterpret_cast<void*>(ram + readAddress));
++	}
++
++	READREPLY reply;
++	reply.header.commandId = COMMANDID_READ;
++	CopyHeader(reply.header, command->header);
++	reply.result = result;
++	reply.unknown2 = 0;
++	reply.unknown3 = 0;
++	reply.unknown4 = 0;
++
+ 	//Delay read reply to next frame.
+ 	//Some games, like Shadow of the Colossus, seem to rely on the delay to
+ 	//work properly (probably because it causes EE threads to be rescheduled).
+@@ -525,8 +582,26 @@ void CFileIoHandler2200::PrepareGenericReply(uint8* ram, const COMMANDHEADER& he
+ 	}
+ }
+ 
++void CFileIoHandler2200::CompletePendingRead(uint8* ram)
++{
++	assert(m_pendingRead.valid);
++	m_pendingRead.valid = false;
++	auto result = m_ioman->Read(m_pendingRead.fileId, m_pendingRead.size, reinterpret_cast<void*>(ram + m_pendingRead.address));
++	//Its reply is still pending (only a read's reply is put off past the call), with no result yet
++	assert(m_pendingReply.valid && (m_pendingReply.replySize == sizeof(READREPLY)));
++	if(m_pendingReply.valid && (m_pendingReply.replySize == sizeof(READREPLY)))
++	{
++		auto reply = reinterpret_cast<READREPLY*>(m_pendingReply.buffer.data());
++		reply->result = result;
++	}
++}
++
+ void CFileIoHandler2200::SendPendingReply(uint8* ram)
+ {
++	if(m_pendingRead.valid)
++	{
++		CompletePendingRead(ram);
++	}
+ 	//Send response
+ 	if(m_resultPtr[0] != 0)
+ 	{
+diff --git a/Source/iop/Iop_FileIoHandler2200.h b/Source/iop/Iop_FileIoHandler2200.h
+index a2def746..028c279e 100644
+--- a/Source/iop/Iop_FileIoHandler2200.h
++++ b/Source/iop/Iop_FileIoHandler2200.h
+@@ -10,7 +10,7 @@ namespace Iop
+ 	class CFileIoHandler2200 : public CFileIo::CHandler
+ 	{
+ 	public:
+-		CFileIoHandler2200(CIoman*, CSifMan&);
++		CFileIoHandler2200(CIoman*, CSifMan&, CIopBios&);
+ 
+ 		bool Invoke(uint32, uint32*, uint32, uint32*, uint32, uint8*) override;
+ 
+@@ -312,9 +312,24 @@ namespace Iop
+ 		void PrepareGenericReply(uint8*, const COMMANDHEADER&, COMMANDID, uint32);
+ 		void SendPendingReply(uint8*);
+ 		void SendSifReply();
++		void CompletePendingRead(uint8*);
++
++		//A read of a file on the disc (cdrom0:) is done when its reply goes out, not when it's
++		//asked for: the disc's stream is told about it first (see CCdvdman::MoveHead), and the
++		//reply waits for the drive's seek, if any (readyTime, in IOP cycles).
++		struct PENDINGREAD
++		{
++			bool valid = false;
++			uint32 fileId = 0;
++			uint32 size = 0;
++			uint32 address = 0;
++			uint64 readyTime = 0;
++		};
+ 
+ 		CSifMan& m_sifMan;
++		CIopBios& m_bios;
+ 		uint32 m_resultPtr[2];
+ 		PENDINGREPLY m_pendingReply;
++		PENDINGREAD m_pendingRead;
+ 	};
+ };
+diff --git a/Source/iop/ioman/OpticalMediaDevice.cpp b/Source/iop/ioman/OpticalMediaDevice.cpp
+index fcca88ab..fca4fa93 100644
+--- a/Source/iop/ioman/OpticalMediaDevice.cpp
++++ b/Source/iop/ioman/OpticalMediaDevice.cpp
+@@ -2,6 +2,7 @@
+ #include <algorithm>
+ #include <string>
+ #include "OpticalMediaDirectoryIterator.h"
++#include "ISO9660/File.h"
+ 
+ using namespace Iop::Ioman;
+ 
+@@ -100,3 +101,19 @@ bool COpticalMediaFile::IsEOF()
+ {
+ 	return m_baseStream->IsEOF();
+ }
++
++bool COpticalMediaFile::GetReadBlocks(uint64 size, uint32& address, uint32& count) const
++{
++	auto file = dynamic_cast<const ISO9660::CFile*>(m_baseStream.get());
++	if(!file) return false;
++	file->GetReadBlocks(size, address, count);
++	return true;
++}
++
++void COpticalMediaFile::HintRead(uint64 size, uint32 source, uint32 seekUs)
++{
++	if(auto file = dynamic_cast<ISO9660::CFile*>(m_baseStream.get()))
++	{
++		file->HintRead(size, source, seekUs);
++	}
++}
+diff --git a/Source/iop/ioman/OpticalMediaDevice.h b/Source/iop/ioman/OpticalMediaDevice.h
+index 5270b953..a68d3acd 100644
+--- a/Source/iop/ioman/OpticalMediaDevice.h
++++ b/Source/iop/ioman/OpticalMediaDevice.h
+@@ -38,6 +38,11 @@ namespace Iop
+ 			uint64 Write(const void*, uint64) override;
+ 			bool IsEOF() override;
+ 
++			//The disc blocks a Read of this size would touch from here (false if this isn't
++			//a file on the disc), and telling the disc's stream they are coming (CReadHintTarget)
++			bool GetReadBlocks(uint64 size, uint32& address, uint32& count) const;
++			void HintRead(uint64 size, uint32 source, uint32 seekUs);
++
+ 		private:
+ 			std::unique_ptr<Framework::CStream> m_baseStream;
+ 		};

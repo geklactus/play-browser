@@ -123,6 +123,40 @@ number GitHub shows on the asset).
     which come from its SIMDe `arm_neon.h`: without the flag every vector operation (the
     8- and 4-bit texture swizzle conversions, for one) compiles to scalar emulation. The Wasm
     code generator already emits SIMD instructions, so nothing new is required of the browser.
+  - `0014-disc-read-hint-and-seek.patch`: the CDVD read the disc when a read was *issued* —
+    synchronously, so with the disc on the network the whole VM stood still until the bytes
+    came — and only then started the read's modelled drive time. Now `CdRead` and cdvdfsv's
+    `Read` / `ReadIopMem` / `StreamRead` tell the disc stream what is coming the moment they
+    are issued (`discImageDevice.hint(offset, size, source, seekUs)`, proxied to the main
+    thread *without* waiting) and copy the sectors when the drive time is up: if the page
+    fetched them meanwhile, nothing waits. EE `cdrom0:` reads (fileio, handler 2200) go
+    through the same drive and are put off the same way — the reply already went out a
+    frame later; now the read happens then too, after any seek time. Handlers 1000/2100 and
+    the IOP's own `ioman` reads still read at once. `ReadChain` still copies at issue (it
+    only moves the head). The drive time gains a **seek** when a read doesn't carry on from
+    the last one: a fifth of the full-stroke time next door, rising linearly to all of it a
+    whole DVD layer away (2,295,104 sectors); up to 16 sectors ahead the drive reads through
+    instead. Full stroke is `ps2.cdvd.seektime` in config.xml, in ms (default 150; 0 turns
+    the model off). The seek is only charged when the bytes **aren't at hand**: the stream
+    keeps a byte per MiB of the disc in wasm memory and hands the page its address
+    (`discImageDevice.presence(ptr, count, shift)`); the page sets a byte while it has that
+    MiB in memory or on the device. Seeking on every read (`ps2.cdvd.seekalways`) made
+    loading measurably slower on a fast link, so it is off by default. A page without
+    `presence` is taken to have the whole disc at hand — a local `File`, or a page from
+    before this patch — so it is charged no seeks, as before (and one without `hint` is
+    told nothing). Save states keep the pending read and the head. Measured on The Simpsons:
+    Hit & Run (an EE libcdvd game: its reads are all cdvdfsv `Read`s) from a server over
+    100 Mbit/s with 40 ms to first byte, first launch on a fresh browser profile, 180 s, two
+    runs, with retroarch's `ps2.js` answering `hint` and `presence`: the game stopped for the
+    disc 56–57 times, 0.7 s in all, and never after the first 90 s, against 74 times, 2.6 s
+    (0.2 s of it after 90 s) with the previous engine and page — and 70–71 times, 1.7 s, with
+    the hint but no seek model (`?seek=0`); 34–36 seeks were charged, 1.2–1.3 s of drive
+    time, during which the VM runs on. Unthrottled, 1–2 seeks (≤ 0.1 s) were charged and the
+    game had read as much by 20, 60 and 90 s as with the seek model off. Frame rate: at
+    100 Mbit/s a median of 34–36 fps (32–34 before) and a worst second of 23–25 in the first
+    140 s (15 before, in the boot's waits; later, one run had got as far as the game's
+    in-engine intro, which runs at 14–18 fps without touching the disc); unthrottled the same
+    as before (median 35–36, worst 21–23 against 22–24, at the same moments of the game).
 - One tweak to the SDK itself, made by the workflow before the build (`Widen Emscripten's
   OpenAL scheduling window`): Emscripten's `library_openal.js` never schedules more than
   100 ms of queued audio ahead of the clock, which would make the pre-buffer pointless —
@@ -165,6 +199,8 @@ const Module = await Play({
 });
 Module.FS.mkdir("/work");
 Module.discImageDevice = { getFileSize() {…}, read(dstPtr, offset, size) {…}, isDone() {…} };
+// optional (0014): told what the drive is about to read; handed a map of what is at hand
+//   hint(offset, size, source, seekUs) {…}, presence(ptr, count, shift) {…}
 Module.ccall("initVm", "", [], []);           // needs <canvas id="outputCanvas" width="640" height="480">
 Module.bootDiscImage("Game Name.iso");        // the extension picks the image format
 ```
